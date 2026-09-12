@@ -1,0 +1,59 @@
+[package]
+name        = "query-builder-nv"
+version     = "0.0.1"
+description = "SELECT, INSERT, UPDATE and DELETE as typed values with joins, CTEs, upsert and a where-clause AST, rendered into a caller's buffer for four SQL dialects with the parameter list coming out beside the text: a bound value sits in the tree at the point it is used, so the caller never writes a placeholder and never keeps a list in step with one.  No execution.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`, and the absence a reader should check for is the database.
+# There is none: this package builds a value and renders it into a
+# buffer the caller owns, and executing the result is std.sql's,
+# pager-nv's or a driver's.  A builder that could also execute would
+# be a builder that needed a connection to test, and the whole of this
+# package is testable as bytes.
+#
+# NO `tests/embedded_probe.nv`, and the absence is a claim not made
+# rather than a claim skipped.  A statement is a tree of lists of
+# strings; a device that talks to a database talks to it over a
+# network, and the query it sends was built on the other end.
+layer       = "core"
+
+category    = "databases"
+
+tags        = ["sql", "query-builder", "sea-query", "sqlalchemy", "sqlx", "postgres", "sqlite", "mysql"]
+repository  = "https://github.com/novolang/query-builder-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "Typed SQL construction for four dialects"
+
+[dependencies]
+# NONE, and that is a decision rather than an accident.
+#
+# The obvious dependency would be sql-engine-nv, for its `cell.Cell` as
+# the bound-value type and its `sqlast` as the tree.  Both are
+# refused for one reason: a query builder that pulls in a whole SQL
+# engine to construct a string is a builder nobody uses against
+# PostgreSQL, and PostgreSQL is three of the four dialects' worth of
+# the audience.  `QbValue` is six variants and the conversion to any
+# driver's own value type is one `match` in the caller.
+#
+# The trees are different anyway.  `sqlast` is a PARSER's output: it
+# has every statement SQLite accepts, including the DDL this package
+# does not build, and it has no notion of a bound parameter because
+# the dialect it was written for has no placeholder token.  `qbast` is
+# a BUILDER's input: four statements, and `QbBind` in the tree.
+#
+# NOT std.sql either.  The plan's row says "std.sql executes it", and
+# that is the right direction of dependency: a consumer takes both, and
+# this package does not know that the other exists.

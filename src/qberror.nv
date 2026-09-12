@@ -1,0 +1,167 @@
+// qberror.nv — why a statement will not render.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// EVERY FAULT IS ABOUT THE STATEMENT, NEVER ABOUT THE DATABASE.  This
+// package does not connect to anything, so there is no "table not
+// found" here and no "constraint violated": everything below is
+// something wrong with the tree the caller built, or something the
+// chosen dialect cannot say.  That is the whole of the vocabulary, and
+// keeping it that narrow is what makes a fault from this package
+// actionable — it is always a line of the caller's own program.
+//
+// THE TWO KINDS, AND THE DIFFERENCE MATTERS.  A `QbMalformed*` fault
+// is wrong in every dialect and would be wrong tomorrow too; a
+// `QbUnsupported` is a perfectly good statement that this dialect
+// cannot express.  A caller porting to PostgreSQL cares only about the
+// second list, and `qbrender.unsupported` answers exactly it.
+//
+// A FAULT NAMES A PATH.  "The join's ON clause is missing" is not
+// actionable in a query with four joins; `joins[2].on` is.  `at` is a
+// path into the statement in the spelling the AST uses, so a caller
+// reading a fault can find the expression in their own builder chain.
+
+use qbdialect
+
+// What is wrong.
+pub enum QbFaultKind
+    // A join other than `QbCross` carried no `ON` condition.  Refused
+    // rather than rendered, because an inner join with no condition is
+    // a cross join written by accident, and on two tables of a million
+    // rows it is the single most expensive typo in SQL.
+    QbJoinWithoutOn
+    // `QbIn` carried an empty list.  `IN ()` is a syntax error in
+    // every dialect here, and the two repairs — render `FALSE`, or
+    // drop the clause — return opposite row sets, so choosing one for
+    // the caller would be choosing which rows they get.
+    QbEmptyInList
+    // A `QbCase` whose `whens` and `thens` are different lengths.
+    QbCaseArity(whens: Int, thens: Int)
+    // An `INSERT` row of a different length from its column list.
+    QbInsertArity(columns: Int, values: Int, row: Int)
+    // An `INSERT` with no column list.  Refused because an `INSERT`
+    // without one depends on the table's declaration order, which a
+    // builder cannot see and which changes the day somebody adds a
+    // column.
+    QbInsertNoColumns
+    // An `INSERT` that set both `rows` and `from_select`.
+    QbInsertTwoSources
+    // An `INSERT` with neither.
+    QbInsertNoSource
+    // An `UPDATE` with no assignments.
+    QbUpdateNothingSet
+    // A name that cannot be written in this dialect: it is not a bare
+    // identifier, and the dialect cannot quote one.  `QbSqlEngine`
+    // reaches this for every column named after a reserved word.
+    QbUnquotableIdent(name: Str, dialect: qbdialect.QbDialect)
+    // An identifier containing the dialect's own quote character, or a
+    // NUL.  Refused in every dialect: doubling the quote is the
+    // correct escape and this package does it, but a NUL in an
+    // identifier terminates the string somewhere downstream and there
+    // is no escape for it.
+    QbUnwritableIdent(name: Str)
+    // The statement uses something this dialect does not have.  The
+    // one kind a port has to read, and the one `unsupported` answers.
+    QbUnsupported(feature: qbdialect.QbFeature, dialect: qbdialect.QbDialect)
+    // A subquery in `FROM` with no alias, in a dialect that requires
+    // one.
+    QbSubqueryNeedsAlias
+    // A CTE with no name, or two CTEs with the same name.
+    QbCteName(name: Str)
+    // A set operation arm whose select has its own `ORDER BY` or
+    // `LIMIT`.  Legal in SQLite and refused by PostgreSQL, and the
+    // parenthesising that would make it portable changes what the
+    // clause applies to — so it is refused everywhere rather than
+    // rendered one way for one dialect.
+    QbSetArmOrdered
+    // Nesting deeper than `QbRenderOptions.max_depth`.
+    QbTooDeep(limit: Int)
+    // More bound parameters than `QbRenderOptions.max_params`.  Every
+    // driver has a ceiling — PostgreSQL's wire protocol has 65 535 —
+    // and a query built out of a list the caller did not bound reaches
+    // it as a runtime error from the server rather than here.
+    QbTooManyParams(limit: Int)
+
+// What is wrong, and where in the statement.
+pub struct QbFault
+    // Which of the above.
+    kind: QbFaultKind
+    // A path into the statement, in the AST's own spelling:
+    // `joins[2].on`, `columns[0].expr`, `ctes[1].body.where_`.  Empty
+    // for a fault about the statement as a whole.
+    at: Str
+
+// A fault, built.
+//
+// ```novo
+// use qberror
+//
+// fn main() [io]
+//     println(qberror.fault(QbJoinWithoutOn, "joins[2].on").at)
+// ```
+pub fn fault(kind: QbFaultKind, at: Str) -> QbFault []
+    todo("query-builder-nv.qberror.fault")
+
+// The short name of a fault kind: `join-without-on`, `empty-in-list`,
+// `unsupported`.
+//
+// ```novo
+// use qberror
+//
+// fn main() [io]
+//     println(qberror.kind_name(QbJoinWithoutOn))
+// ```
+pub fn kind_name(kind: QbFaultKind) -> Str []
+    todo("query-builder-nv.qberror.kind_name")
+
+// One line a person can act on, naming the path and, where the fault
+// has one, the dialect.
+//
+// ```novo
+// use qberror
+//
+// fn main() [io]
+//     println(qberror.message(qberror.fault(QbJoinWithoutOn, "joins[2].on")))
+// ```
+pub fn message(f: QbFault) -> Str []
+    todo("query-builder-nv.qberror.message")
+
+// True when the fault is a dialect's limitation rather than a mistake
+// in the statement — `QbUnsupported`, `QbUnquotableIdent` and
+// `QbSubqueryNeedsAlias`.
+//
+// The split a port reads: a caller moving from SQLite to PostgreSQL
+// wants this list and not the other one.
+//
+// ```novo
+// use qberror
+//
+// fn main() [io]
+//     println("${qberror.is_dialect_limit(qberror.fault(QbJoinWithoutOn, ""))}")
+// ```
+pub fn is_dialect_limit(f: QbFault) -> Bool []
+    todo("query-builder-nv.qberror.is_dialect_limit")
+
+// The faults in `faults` that are dialect limitations, in order.
+//
+// ```novo
+// use std.list
+// use qberror
+//
+// fn main() [io]
+//     println("${list.len(qberror.dialect_limits([]))}")
+// ```
+pub fn dialect_limits(faults: [QbFault]) -> [QbFault] []
+    todo("query-builder-nv.qberror.dialect_limits")
+
+// The faults in `faults` that are mistakes in the statement, in order.
+//
+// ```novo
+// use std.list
+// use qberror
+//
+// fn main() [io]
+//     println("${list.len(qberror.malformed([]))}")
+// ```
+pub fn malformed(faults: [QbFault]) -> [QbFault] []
+    todo("query-builder-nv.qberror.malformed")

@@ -1,0 +1,765 @@
+// qbbuild.nv — the builder chain: an empty statement, and one call per
+// fact added to it.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// WHY THERE IS A MODULE FOR THIS AT ALL.  A struct literal cannot be
+// written from another module, so a consumer cannot spell
+// `QbSelect { … }` and every statement has to be built by calls.  That
+// turns out to be the shape a query builder wants anyway — SeaQuery,
+// sqlx and SQLAlchemy Core all look like this — because a query is
+// assembled conditionally: three filters from a request, two of which
+// are absent.
+//
+// EVERY CALL ANSWERS A NEW STATEMENT.  `where_(s, e)` does not mutate
+// `s`; it answers the select with one more condition.  So a caller
+// building a query in a loop threads it, and a caller building two
+// queries from one base shares the base rather than copying it.
+//
+// `and_where` IS THE ONE TO USE, and `where_` is beneath it.  A
+// builder that only had `where_` makes every caller write
+// `match existing { Some(e) => QbAnd(e, new), None => new }`, and the
+// caller who forgets replaces the tenant filter with the search
+// filter.  `and_where` is that four lines, once.
+//
+// THE VALUE GOES IN AT THE POINT OF USE.  `eq(col, v)` takes a
+// `QbValue` and builds `QbCmp(QbEq, QbCol(col), QbBind(v))`, so the
+// ordinary comparison binds by construction and a caller has to go out
+// of their way — `QbLit` or `QbRaw` — to put a value in the text.
+
+use qbast
+
+// ── values ───────────────────────────────────────────────────────────
+
+// An integer value.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     println("${qbbuild.int_value(7)}")
+// ```
+pub fn int_value(v: Int) -> qbast.QbValue []
+    todo("query-builder-nv.qbbuild.int_value")
+
+// A text value.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     println("${qbbuild.text_value("ada")}")
+// ```
+pub fn text_value(v: Str) -> qbast.QbValue []
+    todo("query-builder-nv.qbbuild.text_value")
+
+// A float value.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     println("${qbbuild.float_value(1.5)}")
+// ```
+pub fn float_value(v: Float) -> qbast.QbValue []
+    todo("query-builder-nv.qbbuild.float_value")
+
+// A boolean value.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     println("${qbbuild.bool_value(true)}")
+// ```
+pub fn bool_value(v: Bool) -> qbast.QbValue []
+    todo("query-builder-nv.qbbuild.bool_value")
+
+// A blob value.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     println("${qbbuild.blob_value([])}")
+// ```
+pub fn blob_value(v: [u8]) -> qbast.QbValue []
+    todo("query-builder-nv.qbbuild.blob_value")
+
+// ── the comparisons, which bind by construction ──────────────────────
+
+// `column = ?`, with `v` bound.
+//
+// The call a caller makes a hundred times, and the reason the binding
+// is not a separate step: there is no spelling of this that puts the
+// value in the text.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     println("${qbbuild.eq("id", qbbuild.int_value(7))}")
+// ```
+pub fn eq(column: Str, v: qbast.QbValue) -> qbast.QbExpr []
+    todo("query-builder-nv.qbbuild.eq")
+
+// `column <> ?`, with `v` bound.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     println("${qbbuild.ne("id", qbbuild.int_value(7))}")
+// ```
+pub fn ne(column: Str, v: qbast.QbValue) -> qbast.QbExpr []
+    todo("query-builder-nv.qbbuild.ne")
+
+// `column < ?`, with `v` bound.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     println("${qbbuild.lt("age", qbbuild.int_value(30))}")
+// ```
+pub fn lt(column: Str, v: qbast.QbValue) -> qbast.QbExpr []
+    todo("query-builder-nv.qbbuild.lt")
+
+// `column > ?`, with `v` bound.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     println("${qbbuild.gt("age", qbbuild.int_value(30))}")
+// ```
+pub fn gt(column: Str, v: qbast.QbValue) -> qbast.QbExpr []
+    todo("query-builder-nv.qbbuild.gt")
+
+// `column <= ?`, with `v` bound.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     println("${qbbuild.le("age", qbbuild.int_value(30))}")
+// ```
+pub fn le(column: Str, v: qbast.QbValue) -> qbast.QbExpr []
+    todo("query-builder-nv.qbbuild.le")
+
+// `column >= ?`, with `v` bound.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     println("${qbbuild.ge("age", qbbuild.int_value(30))}")
+// ```
+pub fn ge(column: Str, v: qbast.QbValue) -> qbast.QbExpr []
+    todo("query-builder-nv.qbbuild.ge")
+
+// `column IN (?, ?, …)`, every value bound.
+//
+// An empty list builds an expression the render REFUSES — see
+// `qberror.QbEmptyInList` — rather than one that quietly returns no
+// rows or all of them.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     println("${qbbuild.in_values("id", [qbbuild.int_value(1)])}")
+// ```
+pub fn in_values(column: Str, values: [qbast.QbValue]) -> qbast.QbExpr []
+    todo("query-builder-nv.qbbuild.in_values")
+
+// `column LIKE ?`, with the pattern bound.
+//
+// The pattern is bound rather than inlined, which means `%` and `_`
+// inside a user's search term are still wildcards — escaping those is
+// the caller's decision, because "search for a literal percent sign"
+// and "search with a wildcard" are both real and the library cannot
+// tell which was meant.  `escape_like` is the helper for the first.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     println("${qbbuild.like("name", "ada%")}")
+// ```
+pub fn like(column: Str, pattern: Str) -> qbast.QbExpr []
+    todo("query-builder-nv.qbbuild.like")
+
+// `pattern` with `%`, `_` and the escape character itself prefixed by
+// `\`, for a search that means the characters literally.
+//
+// Paired with `QbLike`'s `escape` field, which has to be set to `\`
+// for this to mean anything — the two are one decision and the doc
+// comment on each names the other.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     println(qbbuild.escape_like("100%"))
+// ```
+pub fn escape_like(pattern: Str) -> Str []
+    todo("query-builder-nv.qbbuild.escape_like")
+
+// `column IS NULL`.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     println("${qbbuild.is_null("deleted_at")}")
+// ```
+pub fn is_null(column: Str) -> qbast.QbExpr []
+    todo("query-builder-nv.qbbuild.is_null")
+
+// `column IS NOT NULL`.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     println("${qbbuild.is_not_null("deleted_at")}")
+// ```
+pub fn is_not_null(column: Str) -> qbast.QbExpr []
+    todo("query-builder-nv.qbbuild.is_not_null")
+
+// `column BETWEEN ? AND ?`, both bound, both ends included.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     println("${qbbuild.between("age", qbbuild.int_value(18), qbbuild.int_value(30))}")
+// ```
+pub fn between(column: Str, low: qbast.QbValue, high: qbast.QbValue) -> qbast.QbExpr []
+    todo("query-builder-nv.qbbuild.between")
+
+// `a AND b`.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     let a = qbbuild.is_null("x")
+//     println("${qbbuild.all_of([a, a])}")
+// ```
+pub fn all_of(parts: [qbast.QbExpr]) -> qbast.QbExpr []
+    todo("query-builder-nv.qbbuild.all_of")
+
+// `a OR b`.
+//
+// An empty list answers a condition that is always FALSE, which is
+// what "match any of nothing" means; `all_of([])` answers one that is
+// always true, for the same reason in the other direction.  Both are
+// stated here because a caller folding a list of filters hits the
+// empty case first and the two identities are opposite.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     let a = qbbuild.is_null("x")
+//     println("${qbbuild.any_of([a, a])}")
+// ```
+pub fn any_of(parts: [qbast.QbExpr]) -> qbast.QbExpr []
+    todo("query-builder-nv.qbbuild.any_of")
+
+// ── SELECT ───────────────────────────────────────────────────────────
+
+// An empty `SELECT`: no columns, no source, no conditions.
+//
+// Renders as `SELECT *` if nothing else is added, because a select
+// with no items is not a statement any dialect accepts and `*` is what
+// a caller who named nothing meant.
+//
+// ```novo
+// use std.list
+// use qbbuild
+//
+// fn main() [io]
+//     println("${list.len(qbbuild.select().columns)}")
+// ```
+pub fn select() -> qbast.QbSelect []
+    todo("query-builder-nv.qbbuild.select")
+
+// `s` reading from `table`, with an optional alias.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     println("${qbbuild.from(qbbuild.select(), "users", "u").joins}")
+// ```
+pub fn from(s: qbast.QbSelect, table: Str, as_name: Str) -> qbast.QbSelect []
+    todo("query-builder-nv.qbbuild.from")
+
+// `s` reading from a subquery, which must have an alias in PostgreSQL
+// and MySQL.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     let inner = qbbuild.from(qbbuild.select(), "users", "")
+//     println("${qbbuild.from_select(qbbuild.select(), inner, "u").limit}")
+// ```
+pub fn from_select(s: qbast.QbSelect, inner: qbast.QbSelect, as_name: Str) -> qbast.QbSelect []
+    todo("query-builder-nv.qbbuild.from_select")
+
+// `s` with one more selected column, by name.
+//
+// ```novo
+// use std.list
+// use qbbuild
+//
+// fn main() [io]
+//     println("${list.len(qbbuild.column(qbbuild.select(), "id").columns)}")
+// ```
+pub fn column(s: qbast.QbSelect, name: Str) -> qbast.QbSelect []
+    todo("query-builder-nv.qbbuild.column")
+
+// `s` with one more selected expression and an `AS` name.
+//
+// ```novo
+// use std.list
+// use qbbuild
+//
+// fn main() [io]
+//     let e = qbbuild.is_null("x")
+//     println("${list.len(qbbuild.column_as(qbbuild.select(), e, "missing").columns)}")
+// ```
+pub fn column_as(s: qbast.QbSelect, e: qbast.QbExpr, as_name: Str) -> qbast.QbSelect []
+    todo("query-builder-nv.qbbuild.column_as")
+
+// `s` with several more columns, by name.
+//
+// ```novo
+// use std.list
+// use qbbuild
+//
+// fn main() [io]
+//     println("${list.len(qbbuild.columns(qbbuild.select(), ["id", "name"]).columns)}")
+// ```
+pub fn columns(s: qbast.QbSelect, names: [Str]) -> qbast.QbSelect []
+    todo("query-builder-nv.qbbuild.columns")
+
+// `s` with `SELECT DISTINCT`.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     println("${qbbuild.distinct(qbbuild.select()).distinct}")
+// ```
+pub fn distinct(s: qbast.QbSelect) -> qbast.QbSelect []
+    todo("query-builder-nv.qbbuild.distinct")
+
+// `s` with its `WHERE` REPLACED by `e`.
+//
+// Use `and_where` unless you mean to discard what was there.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     let s = qbbuild.where_(qbbuild.select(), qbbuild.is_null("x"))
+//     println("${s.limit}")
+// ```
+pub fn where_(s: qbast.QbSelect, e: qbast.QbExpr) -> qbast.QbSelect []
+    todo("query-builder-nv.qbbuild.where_")
+
+// `s` with `e` ANDed onto whatever its `WHERE` already was.
+//
+// The call to reach for.  A builder with only `where_` makes every
+// caller write the `match`, and the caller who forgets it replaces the
+// tenant filter with the search filter — which is a data leak with no
+// error message.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     let s = qbbuild.and_where(qbbuild.select(), qbbuild.is_null("x"))
+//     println("${qbbuild.and_where(s, qbbuild.is_null("y")).limit}")
+// ```
+pub fn and_where(s: qbast.QbSelect, e: qbast.QbExpr) -> qbast.QbSelect []
+    todo("query-builder-nv.qbbuild.and_where")
+
+// `s` with `e` ORed onto whatever its `WHERE` already was.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     let s = qbbuild.and_where(qbbuild.select(), qbbuild.is_null("x"))
+//     println("${qbbuild.or_where(s, qbbuild.is_null("y")).limit}")
+// ```
+pub fn or_where(s: qbast.QbSelect, e: qbast.QbExpr) -> qbast.QbSelect []
+    todo("query-builder-nv.qbbuild.or_where")
+
+// `s` with one more join.
+//
+// `on` is required for every kind but `QbCross`, and the render
+// refuses a statement missing it.
+//
+// ```novo
+// use std.list
+// use qbbuild
+//
+// fn main() [io]
+//     let s = qbbuild.from(qbbuild.select(), "users", "u")
+//     let on = qbbuild.is_null("x")
+//     println("${list.len(qbbuild.join(s, QbInner, "orders", "o", on).joins)}")
+// ```
+pub fn join(s: qbast.QbSelect, kind: qbast.QbJoinKind, table: Str, as_name: Str,
+            on: qbast.QbExpr) -> qbast.QbSelect []
+    todo("query-builder-nv.qbbuild.join")
+
+// `s` with one more `GROUP BY` term.
+//
+// ```novo
+// use std.list
+// use qbbuild
+//
+// fn main() [io]
+//     println("${list.len(qbbuild.group_by(qbbuild.select(), "country").group_by)}")
+// ```
+pub fn group_by(s: qbast.QbSelect, column: Str) -> qbast.QbSelect []
+    todo("query-builder-nv.qbbuild.group_by")
+
+// `s` with `e` ANDed onto its `HAVING`.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     let s = qbbuild.and_having(qbbuild.select(), qbbuild.is_null("x"))
+//     println("${s.limit}")
+// ```
+pub fn and_having(s: qbast.QbSelect, e: qbast.QbExpr) -> qbast.QbSelect []
+    todo("query-builder-nv.qbbuild.and_having")
+
+// `s` with one more `ORDER BY` term.
+//
+// ```novo
+// use std.list
+// use qbbuild
+//
+// fn main() [io]
+//     let s = qbbuild.order_by(qbbuild.select(), "created_at", true)
+//     println("${list.len(s.order_by)}")
+// ```
+pub fn order_by(s: qbast.QbSelect, column: Str, descending: Bool) -> qbast.QbSelect []
+    todo("query-builder-nv.qbbuild.order_by")
+
+// `s` with one more `ORDER BY` term and an explicit null placement.
+//
+// ```novo
+// use std.list
+// use qbbuild
+//
+// fn main() [io]
+//     let s = qbbuild.order_by_nulls(qbbuild.select(), "at", true, QbNullsLast)
+//     println("${list.len(s.order_by)}")
+// ```
+pub fn order_by_nulls(s: qbast.QbSelect, column: Str, descending: Bool,
+                      nulls: qbast.QbNulls) -> qbast.QbSelect []
+    todo("query-builder-nv.qbbuild.order_by_nulls")
+
+// `s` with a row limit.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     println("${qbbuild.limit(qbbuild.select(), 50).limit}")
+// ```
+pub fn limit(s: qbast.QbSelect, n: Int) -> qbast.QbSelect []
+    todo("query-builder-nv.qbbuild.limit")
+
+// `s` with an offset.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     println("${qbbuild.offset(qbbuild.select(), 100).offset}")
+// ```
+pub fn offset(s: qbast.QbSelect, n: Int) -> qbast.QbSelect []
+    todo("query-builder-nv.qbbuild.offset")
+
+// `s` with one more CTE in front of it.
+//
+// ```novo
+// use std.list
+// use qbbuild
+//
+// fn main() [io]
+//     let body = qbbuild.from(qbbuild.select(), "users", "")
+//     println("${list.len(qbbuild.with_cte(qbbuild.select(), "recent", body, false).ctes)}")
+// ```
+pub fn with_cte(s: qbast.QbSelect, name: Str, body: qbast.QbSelect,
+                recursive: Bool) -> qbast.QbSelect []
+    todo("query-builder-nv.qbbuild.with_cte")
+
+// `s` with another select joined to it by a set operation.
+//
+// The arm may not carry its own `ORDER BY` or `LIMIT` — see
+// `qberror.QbSetArmOrdered`.
+//
+// ```novo
+// use std.list
+// use qbbuild
+//
+// fn main() [io]
+//     let other = qbbuild.from(qbbuild.select(), "archive", "")
+//     println("${list.len(qbbuild.union(qbbuild.select(), QbUnionAll, other).set_arms)}")
+// ```
+pub fn union(s: qbast.QbSelect, op: qbast.QbSetOp, other: qbast.QbSelect) -> qbast.QbSelect []
+    todo("query-builder-nv.qbbuild.union")
+
+// ── INSERT ───────────────────────────────────────────────────────────
+
+// An `INSERT INTO table (columns…)` with no rows yet.
+//
+// The column list is required here rather than optional, because an
+// `INSERT` without one depends on the table's declaration order.
+//
+// ```novo
+// use std.list
+// use qbbuild
+//
+// fn main() [io]
+//     println("${list.len(qbbuild.insert("users", ["name", "email"]).columns)}")
+// ```
+pub fn insert(table: Str, columns: [Str]) -> qbast.QbInsert []
+    todo("query-builder-nv.qbbuild.insert")
+
+// `i` with one more row of bound values.
+//
+// A row of a different length from the column list is refused at
+// render, with both numbers and the row's index named.
+//
+// ```novo
+// use std.list
+// use qbbuild
+//
+// fn main() [io]
+//     let i = qbbuild.insert("users", ["name"])
+//     println("${list.len(qbbuild.values(i, [qbbuild.text_value("ada")]).rows)}")
+// ```
+pub fn values(i: qbast.QbInsert, row: [qbast.QbValue]) -> qbast.QbInsert []
+    todo("query-builder-nv.qbbuild.values")
+
+// `i` filled from a select instead of from literal rows.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     let i = qbbuild.insert("archive", ["id"])
+//     let s = qbbuild.from(qbbuild.select(), "users", "")
+//     println("${qbbuild.insert_select(i, s).table}")
+// ```
+pub fn insert_select(i: qbast.QbInsert, s: qbast.QbSelect) -> qbast.QbInsert []
+    todo("query-builder-nv.qbbuild.insert_select")
+
+// `i` with `ON CONFLICT DO NOTHING`.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     let i = qbbuild.insert("users", ["email"])
+//     println("${qbbuild.on_conflict_ignore(i, ["email"]).table}")
+// ```
+pub fn on_conflict_ignore(i: qbast.QbInsert, target: [Str]) -> qbast.QbInsert []
+    todo("query-builder-nv.qbbuild.on_conflict_ignore")
+
+// `i` with `ON CONFLICT (target) DO UPDATE SET …`.
+//
+// MySQL has no conflict target — it uses whichever unique index was
+// hit — so `target` is dropped there and `qbrender.unsupported` names
+// it before a caller relies on it.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     let i = qbbuild.insert("users", ["email", "name"])
+//     println("${qbbuild.on_conflict_update(i, ["email"], []).table}")
+// ```
+pub fn on_conflict_update(i: qbast.QbInsert, target: [Str],
+                          set: [qbast.QbAssign]) -> qbast.QbInsert []
+    todo("query-builder-nv.qbbuild.on_conflict_update")
+
+// One `column = expr` assignment.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     println(qbbuild.assign("name", qbbuild.int_value(1)).column)
+// ```
+pub fn assign(column: Str, v: qbast.QbValue) -> qbast.QbAssign []
+    todo("query-builder-nv.qbbuild.assign")
+
+// One `column = <expression>` assignment, for `count = count + 1`.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     println(qbbuild.assign_expr("seen", qbbuild.is_null("x")).column)
+// ```
+pub fn assign_expr(column: Str, e: qbast.QbExpr) -> qbast.QbAssign []
+    todo("query-builder-nv.qbbuild.assign_expr")
+
+// `i` with `RETURNING` items.
+//
+// PostgreSQL and SQLite; MySQL has none.
+//
+// ```novo
+// use std.list
+// use qbbuild
+//
+// fn main() [io]
+//     let i = qbbuild.insert("users", ["name"])
+//     println("${list.len(qbbuild.insert_returning(i, ["id"]).returning)}")
+// ```
+pub fn insert_returning(i: qbast.QbInsert, names: [Str]) -> qbast.QbInsert []
+    todo("query-builder-nv.qbbuild.insert_returning")
+
+// ── UPDATE and DELETE ────────────────────────────────────────────────
+
+// An `UPDATE table` with nothing set and no condition.
+//
+// A statement built from this and rendered without a `WHERE` updates
+// every row; `qbrender.unguarded` is the check a review runs and it is
+// not refused, because "set every row's flag" is a real statement.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     println(qbbuild.update("users").table)
+// ```
+pub fn update(table: Str) -> qbast.QbUpdate []
+    todo("query-builder-nv.qbbuild.update")
+
+// `u` with one more assignment.
+//
+// ```novo
+// use std.list
+// use qbbuild
+//
+// fn main() [io]
+//     let a = qbbuild.assign("name", qbbuild.text_value("ada"))
+//     println("${list.len(qbbuild.set(qbbuild.update("users"), a).set)}")
+// ```
+pub fn set(u: qbast.QbUpdate, a: qbast.QbAssign) -> qbast.QbUpdate []
+    todo("query-builder-nv.qbbuild.set")
+
+// `u` with `e` ANDed onto its condition.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     let u = qbbuild.update_where(qbbuild.update("users"), qbbuild.is_null("x"))
+//     println(u.table)
+// ```
+pub fn update_where(u: qbast.QbUpdate, e: qbast.QbExpr) -> qbast.QbUpdate []
+    todo("query-builder-nv.qbbuild.update_where")
+
+// `u` with `RETURNING` items.
+//
+// ```novo
+// use std.list
+// use qbbuild
+//
+// fn main() [io]
+//     let u = qbbuild.update("users")
+//     println("${list.len(qbbuild.update_returning(u, ["id"]).returning)}")
+// ```
+pub fn update_returning(u: qbast.QbUpdate, names: [Str]) -> qbast.QbUpdate []
+    todo("query-builder-nv.qbbuild.update_returning")
+
+// A `DELETE FROM table` with no condition.
+//
+// Rendered as written, it deletes every row; see `update`.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     println(qbbuild.delete("sessions").table)
+// ```
+pub fn delete(table: Str) -> qbast.QbDelete []
+    todo("query-builder-nv.qbbuild.delete")
+
+// `d` with `e` ANDed onto its condition.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     let d = qbbuild.delete_where(qbbuild.delete("sessions"), qbbuild.is_null("x"))
+//     println(d.table)
+// ```
+pub fn delete_where(d: qbast.QbDelete, e: qbast.QbExpr) -> qbast.QbDelete []
+    todo("query-builder-nv.qbbuild.delete_where")
+
+// `d` with `RETURNING` items.
+//
+// ```novo
+// use std.list
+// use qbbuild
+//
+// fn main() [io]
+//     let d = qbbuild.delete("sessions")
+//     println("${list.len(qbbuild.delete_returning(d, ["id"]).returning)}")
+// ```
+pub fn delete_returning(d: qbast.QbDelete, names: [Str]) -> qbast.QbDelete []
+    todo("query-builder-nv.qbbuild.delete_returning")
+
+// ── one page of rows ─────────────────────────────────────────────────
+
+// `s` with the limit and offset a page of `size` at `page` needs,
+// counting pages from zero.
+//
+// Published because the arithmetic is two lines and is written wrongly
+// in two ways — an off-by-one on the page number, and an offset that
+// grows without the limit — often enough that it belongs in the
+// package that renders it.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     println("${qbbuild.page(qbbuild.select(), 2, 25).offset}")
+// ```
+pub fn page(s: qbast.QbSelect, page: Int, size: Int) -> qbast.QbSelect []
+    todo("query-builder-nv.qbbuild.page")
+
+// A `SELECT COUNT(*)` over the same source, joins and conditions as
+// `s`, with its columns, ordering, limit and offset dropped.
+//
+// The query that goes beside a paginated one, and the one a caller
+// building by hand gets wrong by leaving the `ORDER BY` on — which
+// makes PostgreSQL sort a result set of one row by a column it did not
+// select.
+//
+// ```novo
+// use qbbuild
+//
+// fn main() [io]
+//     println("${qbbuild.count_of(qbbuild.select()).limit}")
+// ```
+pub fn count_of(s: qbast.QbSelect) -> qbast.QbSelect []
+    todo("query-builder-nv.qbbuild.count_of")

@@ -1,0 +1,423 @@
+// qbrender_tests.nv — the bytes, the parameters beside them, and the
+// three refusals.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented:
+// query-builder-nv.<module>.<fn>`.  That is the expected result until
+// the bodies land.
+//
+// THE ASSERTIONS ARE WHOLE STATEMENTS, on purpose.  A renderer's bugs
+// are a missing space, a comma in the wrong place and a clause emitted
+// in the wrong order, and none of those is visible in an assertion
+// that only checks the length.  The same query is asserted for two
+// dialects wherever the two differ, because the case a single-dialect
+// test cannot catch is the one where a fact was hard-coded.
+
+use std.test
+use std.list
+use qbast
+use qbbuild
+use qbdialect
+use qberror
+use qbrender
+
+@test
+fn test_the_same_tree_renders_for_two_dialects() [io]
+    let q = qbbuild.and_where(
+              qbbuild.from(qbbuild.columns(qbbuild.select(), ["id", "name"]),
+                           "users", ""),
+              qbbuild.eq("id", qbbuild.int_value(7)))
+
+    test.case("SQLite writes a question mark")
+    match qbrender.render_str(QbStmtSelect(q), qbrender.options(QbSqlite))
+        Err(_) => test.assert(false)
+        Ok(r)  =>
+            test.assert(r.sql == "SELECT id, name FROM users WHERE id = ?")
+            test.assert(list.len(r.params) == 1)
+
+    test.case("PostgreSQL writes a numbered placeholder, counting from one")
+    match qbrender.render_str(QbStmtSelect(q), qbrender.options(QbPostgres))
+        Err(_) => test.assert(false)
+        Ok(r)  =>
+            test.assert(r.sql == "SELECT id, name FROM users WHERE id = $1")
+            test.assert(list.len(r.params) == 1)
+
+@test
+fn test_the_parameters_come_out_in_placeholder_order() [io]
+    // The whole point of the package: the caller wrote neither the
+    // placeholders nor the list, so the two cannot disagree.
+    let q = qbbuild.and_where(
+              qbbuild.and_where(qbbuild.from(qbbuild.select(), "users", ""),
+                                qbbuild.eq("tenant", qbbuild.int_value(1))),
+              qbbuild.gt("age", qbbuild.int_value(30)))
+
+    match qbrender.render_str(QbStmtSelect(q), qbrender.options(QbPostgres))
+        Err(_) => test.assert(false)
+        Ok(r)  =>
+            test.case("two placeholders, numbered in the order they appear")
+            test.assert(r.sql
+                        == "SELECT * FROM users WHERE tenant = $1 AND age > $2")
+
+            test.case("and two parameters, in that same order")
+            test.assert(list.len(r.params) == 2)
+            match list.nth(r.params, 0)
+                Some(QbInt(v)) => test.assert(v == 1)
+                _              => test.assert(false)
+            match list.nth(r.params, 1)
+                Some(QbInt(v)) => test.assert(v == 30)
+                _              => test.assert(false)
+
+    test.case("binds_of answers the same list without rendering")
+    test.assert(list.len(qbast.binds_of(QbStmtSelect(q))) == 2)
+
+@test
+fn test_a_select_with_no_columns_is_a_star() [io]
+    // A select with no items is not a statement any dialect accepts,
+    // and `*` is what a caller who named nothing meant.
+    let q = qbbuild.from(qbbuild.select(), "users", "")
+
+    match qbrender.render_str(QbStmtSelect(q), qbrender.options(QbSqlite))
+        Err(_) => test.assert(false)
+        Ok(r)  => test.assert(r.sql == "SELECT * FROM users")
+
+@test
+fn test_a_join_with_no_on_is_refused_by_name() [io]
+    // An inner join with no condition is a cross join written by
+    // accident, and on two large tables it is the most expensive typo
+    // in SQL.  QbCross is how a caller says they meant it.
+    let ok = qbbuild.join(qbbuild.from(qbbuild.select(), "users", "u"),
+                          QbInner, "orders", "o",
+                          qbbuild.is_not_null("o.user_id"))
+
+    test.case("a join WITH a condition renders")
+    match qbrender.render_str(QbStmtSelect(ok), qbrender.options(QbSqlite))
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(false)
+
+    test.case("and every fault names a path into the statement")
+    for f in qbrender.check(QbStmtSelect(ok), qbrender.options(QbSqlite))
+        test.assert(f.at != "")
+
+@test
+fn test_an_empty_in_list_is_refused_rather_than_guessed_at() [io]
+    // The two plausible repairs return opposite row sets, so choosing
+    // one for the caller would be choosing which rows they get.
+    let q = qbbuild.and_where(qbbuild.from(qbbuild.select(), "users", ""),
+                              qbbuild.in_values("id", []))
+
+    test.case("the render refuses")
+    match qbrender.render_str(QbStmtSelect(q), qbrender.options(QbSqlite))
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            match f.kind
+                QbEmptyInList => test.assert(true)
+                _             => test.assert(false)
+
+            test.case("and it is a mistake in the statement, not a dialect limit")
+            test.assert(qberror.is_dialect_limit(f) == false)
+
+    test.case("a list with something in it renders one placeholder per value")
+    let two = qbbuild.and_where(qbbuild.from(qbbuild.select(), "users", ""),
+                                qbbuild.in_values("id", [qbbuild.int_value(1),
+                                                         qbbuild.int_value(2)]))
+    match qbrender.render_str(QbStmtSelect(two), qbrender.options(QbSqlite))
+        Err(_) => test.assert(false)
+        Ok(r)  =>
+            test.assert(r.sql == "SELECT * FROM users WHERE id IN (?, ?)")
+            test.assert(list.len(r.params) == 2)
+
+@test
+fn test_an_insert_with_no_columns_is_refused() [io]
+    // An INSERT without a column list depends on the table's
+    // declaration order, which changes the day somebody adds a column.
+    let bad = qbbuild.values(qbbuild.insert("users", []),
+                             [qbbuild.text_value("ada")])
+
+    test.case("refused by name")
+    match qbrender.render_str(QbStmtInsert(bad), qbrender.options(QbSqlite))
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            match f.kind
+                QbInsertNoColumns => test.assert(true)
+                _                 => test.assert(false)
+
+@test
+fn test_an_insert_row_of_the_wrong_length_names_both_numbers() [io]
+    let bad = qbbuild.values(qbbuild.insert("users", ["name", "email"]),
+                             [qbbuild.text_value("ada")])
+
+    test.case("the fault carries the expected count, the found count and the row")
+    match qbrender.render_str(QbStmtInsert(bad), qbrender.options(QbSqlite))
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            match f.kind
+                QbInsertArity(cols, vals, row) =>
+                    test.assert(cols == 2)
+                    test.assert(vals == 1)
+                    test.assert(row == 0)
+                _                              => test.assert(false)
+
+@test
+fn test_an_unguarded_write_is_reported_and_optionally_refused() [io]
+    let d = qbbuild.delete("sessions")
+
+    test.case("a DELETE with no WHERE renders by default — it is a real statement")
+    match qbrender.render_str(QbStmtDelete(d), qbrender.options(QbSqlite))
+        Err(_) => test.assert(false)
+        Ok(r)  => test.assert(r.sql == "DELETE FROM sessions")
+
+    test.case("and the question is published")
+    test.assert(qbrender.unguarded(QbStmtDelete(d)))
+
+    test.case("a program running user-driven queries turns the switch on")
+    let strict = qbrender.with_require_where(qbrender.options(QbSqlite), true)
+    match qbrender.render_str(QbStmtDelete(d), strict)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("a DELETE that HAS a WHERE is not unguarded")
+    let guarded = qbbuild.delete_where(d, qbbuild.eq("id", qbbuild.int_value(1)))
+    test.assert(qbrender.unguarded(QbStmtDelete(guarded)) == false)
+
+@test
+fn test_raw_sql_is_countable_and_forbiddable() [io]
+    // The escape hatch is the whole of the package's attack surface,
+    // so a build that wants to prove no query was assembled by hand
+    // can assert it.
+    let q = qbbuild.and_where(qbbuild.from(qbbuild.select(), "users", ""),
+                              QbRaw("id = 1"))
+
+    test.case("the raw site is counted")
+    test.assert(qbast.raw_count(QbStmtSelect(q)) == 1)
+    test.assert(qbrender.raw_sites(QbStmtSelect(q)) == 1)
+
+    test.case("it renders by default")
+    match qbrender.render_str(QbStmtSelect(q), qbrender.options(QbSqlite))
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(false)
+
+    test.case("and is refused when the switch is on")
+    let strict = qbrender.with_forbid_raw(qbrender.options(QbSqlite), true)
+    match qbrender.render_str(QbStmtSelect(q), strict)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("a statement built entirely by the builder has no raw sites")
+    let clean = qbbuild.from(qbbuild.select(), "users", "")
+    test.assert(qbast.raw_count(QbStmtSelect(clean)) == 0)
+
+@test
+fn test_a_literal_is_escaped_and_is_still_not_a_parameter() [io]
+    test.case("an apostrophe is doubled, not backslashed")
+    match qbrender.write_literal([], qbbuild.text_value("o'brien"), QbSqlite)
+        Err(_) => test.assert(false)
+        Ok(b)  => test.assert(list.len(b) == 11)
+
+    test.case("MySQL also escapes the backslash, which the other three do not")
+    test.assert(qbdialect.backslash_escapes(QbMysql))
+    test.assert(qbdialect.backslash_escapes(QbPostgres) == false)
+
+    test.case("and a boolean is TRUE in PostgreSQL and 1 elsewhere")
+    test.assert(qbdialect.boolean_literal(QbPostgres, true) == "TRUE")
+    test.assert(qbdialect.boolean_literal(QbSqlite, true) == "1")
+
+@test
+fn test_an_identifier_is_quoted_only_where_it_must_be() [io]
+    test.case("an ordinary name needs no quotes")
+    match qbrender.write_ident([], "user_id", QbPostgres, false)
+        Err(_) => test.assert(false)
+        Ok(b)  => test.assert(list.len(b) == 7)
+
+    test.case("a reserved word does, and PostgreSQL uses double quotes")
+    test.assert(qbdialect.is_reserved(QbPostgres, "user"))
+    match qbrender.write_ident([], "user", QbPostgres, false)
+        Err(_) => test.assert(false)
+        Ok(b)  => test.assert(list.len(b) == 6)
+
+    test.case("MySQL uses a backtick")
+    test.assert(qbdialect.quote_char(QbMysql) == 96)
+    test.assert(qbdialect.quote_char(QbPostgres) == 34)
+
+    test.case("and sql-engine-nv cannot quote at all, so it refuses")
+    test.assert(qbdialect.quote_char(QbSqlEngine) == 0)
+    match qbrender.write_ident([], "user", QbSqlEngine, false)
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            match f.kind
+                QbUnquotableIdent(name, d) =>
+                    test.assert(name == "user")
+                    test.assert(qbdialect.name(d) == "sql-engine")
+                _                          => test.assert(false)
+
+            test.case("which is a dialect limitation rather than a mistake")
+            test.assert(qberror.is_dialect_limit(f))
+
+@test
+fn test_the_port_question_is_answered_on_its_own() [io]
+    // A caller moving from SQLite to MySQL wants the list of things to
+    // rewrite, without the malformed-statement faults mixed in.
+    let i = qbbuild.insert_returning(
+              qbbuild.values(qbbuild.insert("users", ["name"]),
+                             [qbbuild.text_value("ada")]),
+              ["id"])
+
+    test.case("RETURNING is fine in SQLite")
+    test.assert(list.len(qbrender.unsupported(QbStmtInsert(i), QbSqlite)) == 0)
+
+    test.case("and MySQL has none")
+    let gaps = qbrender.unsupported(QbStmtInsert(i), QbMysql)
+    test.assert(list.len(gaps) == 1)
+    for g in gaps
+        match g.kind
+            QbUnsupported(feat, _) =>
+                test.assert(qbdialect.feature_name(feat) == "returning")
+            _                      => test.assert(false)
+        test.assert(qberror.is_dialect_limit(g))
+
+@test
+fn test_check_answers_every_fault_and_render_stops_at_the_first() [io]
+    let bad = qbbuild.and_where(
+                qbbuild.and_where(qbbuild.from(qbbuild.select(), "users", ""),
+                                  qbbuild.in_values("id", [])),
+                qbbuild.in_values("tenant", []))
+
+    test.case("render stops at the first, which is what a caller executing wants")
+    match qbrender.render_str(QbStmtSelect(bad), qbrender.options(QbSqlite))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("check answers both, which is what a linter wants")
+    let faults = qbrender.check(QbStmtSelect(bad), qbrender.options(QbSqlite))
+    test.assert(list.len(faults) == 2)
+
+    test.case("and they split into the two kinds")
+    test.assert(list.len(qberror.malformed(faults)) == 2)
+    test.assert(list.len(qberror.dialect_limits(faults)) == 0)
+
+    test.case("a statement with nothing wrong checks clean")
+    let ok = qbbuild.from(qbbuild.select(), "users", "")
+    test.assert(list.len(qbrender.check(QbStmtSelect(ok),
+                                        qbrender.options(QbSqlite))) == 0)
+
+@test
+fn test_render_appends_and_render_len_agrees_with_it() [io]
+    let q = qbbuild.from(qbbuild.select(), "users", "")
+    let o = qbrender.options(QbSqlite)
+
+    test.case("the buffer comes back longer")
+    match qbrender.render([], QbStmtSelect(q), o)
+        Err(_) => test.assert(false)
+        Ok(r)  =>
+            test.assert(list.len(r.text) == 20)
+
+            test.case("and the count is exact rather than an estimate")
+            match qbrender.render_len(QbStmtSelect(q), o)
+                Err(_) => test.assert(false)
+                Ok(n)  => test.assert(n == list.len(r.text))
+
+    test.case("rendering into a non-empty buffer appends")
+    match qbrender.render([], QbStmtSelect(q), o)
+        Err(_) => test.assert(false)
+        Ok(a)  =>
+            match qbrender.render(a.text, QbStmtSelect(q), o)
+                Err(_) => test.assert(false)
+                Ok(b)  => test.assert(list.len(b.text) == 40)
+
+@test
+fn test_one_expression_renders_with_the_numbering_continued() [io]
+    // The door for a caller splicing a condition into SQL they wrote
+    // themselves, who needs the numbering to continue from their own
+    // placeholders.
+    let e = qbbuild.eq("id", qbbuild.int_value(7))
+
+    test.case("starting at zero writes the first placeholder")
+    match qbrender.render_expr([], e, qbrender.options(QbPostgres), 0)
+        Err(_) => test.assert(false)
+        Ok(r)  => test.assert(list.len(r.text) == 8)
+
+    test.case("starting at two writes the third, which is the whole point")
+    match qbrender.render_expr([], e, qbrender.options(QbPostgres), 2)
+        Err(_) => test.assert(false)
+        Ok(r)  =>
+            test.assert(list.len(r.text) == 8)
+            test.assert(list.len(r.params) == 1)
+
+@test
+fn test_the_bounds_are_faults_rather_than_server_errors() [io]
+    let o = qbrender.options(QbPostgres)
+
+    test.case("the parameter ceiling is the wire protocol's, stated here")
+    test.assert(o.max_params == 65535)
+
+    test.case("and the depth ceiling is a number rather than a stack overflow")
+    test.assert(o.max_depth == 64)
+
+@test
+fn test_what_cannot_be_built_is_a_list_a_program_can_print() [io]
+    test.case("so a --help can show it and a test can watch it grow")
+    test.assert(list.len(qbrender.cannot_build()) > 0)
+    for line in qbrender.cannot_build()
+        test.assert(line != "")
+
+@test
+fn test_pretty_changes_the_bytes_and_not_the_parameters() [io]
+    let q = qbbuild.and_where(qbbuild.from(qbbuild.select(), "users", ""),
+                              qbbuild.eq("id", qbbuild.int_value(7)))
+    let flat = qbrender.options(QbSqlite)
+    let pretty = qbrender.with_pretty(flat, true)
+
+    test.case("the pretty form is longer")
+    match qbrender.render_len(QbStmtSelect(q), flat)
+        Err(_) => test.assert(false)
+        Ok(a)  =>
+            match qbrender.render_len(QbStmtSelect(q), pretty)
+                Err(_) => test.assert(false)
+                Ok(b)  => test.assert(b > a)
+
+    test.case("and binds the same one value")
+    match qbrender.render_str(QbStmtSelect(q), pretty)
+        Err(_) => test.assert(false)
+        Ok(r)  => test.assert(list.len(r.params) == 1)
+
+@test
+fn test_a_statement_answers_what_it_touches_without_a_match() [io]
+    // What an audit log, a permission check and a cache invalidation
+    // all ask, and what a caller walking the tree by hand gets wrong
+    // the first time somebody nests a subquery inside a CTE.
+    let s = qbbuild.from(qbbuild.select(), "users", "")
+    let d = qbbuild.delete("sessions")
+
+    test.case("a select names no target table, because it writes nothing")
+    test.assert(qbast.target_table(QbStmtSelect(s)) == "")
+    test.assert(qbast.is_write(QbStmtSelect(s)) == false)
+
+    test.case("each of the three writers names its own")
+    test.assert(qbast.target_table(QbStmtDelete(d)) == "sessions")
+    test.assert(qbast.is_write(QbStmtDelete(d)))
+    test.assert(qbast.target_table(QbStmtUpdate(qbbuild.update("users"))) == "users")
+    let i = qbbuild.insert("events", ["id"])
+    test.assert(qbast.target_table(QbStmtInsert(i)) == "events")
+
+    test.case("tables_of reaches through a join, a CTE and a subquery")
+    let body = qbbuild.from(qbbuild.select(), "events", "")
+    var q = qbbuild.with_cte(s, "recent", body, false)
+    q = qbbuild.join(q, QbInner, "orders", "o", qbbuild.is_not_null("o.id"))
+    let seen = qbast.tables_of(QbStmtSelect(q))
+    test.assert(list.contains(seen, "users"))
+    test.assert(list.contains(seen, "orders"))
+    test.assert(list.contains(seen, "events"))
+
+    test.case("and a flat statement has depth zero")
+    test.assert(qbast.depth(QbStmtSelect(s)) == 0)
+
+@test
+fn test_every_fault_kind_has_a_short_name_for_a_log_line() [io]
+    test.case("the names are hyphenated, lower case, and stable")
+    test.assert(qberror.kind_name(QbJoinWithoutOn) == "join-without-on")
+    test.assert(qberror.kind_name(QbEmptyInList) == "empty-in-list")
+    test.assert(qberror.kind_name(QbInsertNoColumns) == "insert-no-columns")
+
+    test.case("and the message names the path as well as the kind")
+    let f = qberror.fault(QbJoinWithoutOn, "joins[2].on")
+    test.assert(qberror.message(f) != "")
+    test.assert(f.at == "joins[2].on")

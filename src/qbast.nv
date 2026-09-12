@@ -1,0 +1,482 @@
+// qbast.nv — a SQL statement as a value: the whole vocabulary, in one
+// module.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE VALUE IS IN THE TREE, NOT IN A LIST BESIDE IT.  That is the
+// load-bearing decision, and it is what makes this a query builder
+// rather than a string joiner with extra steps.  `QbBind(v)` puts the
+// value at the point it is used — `QbCmp(QbEq, QbCol("id"),
+// QbBind(QbInt(7)))` — and `qbrender.render` assigns the positions as
+// it walks.  The caller never writes a placeholder and never keeps a
+// list in step with one.
+//
+// sqlx's `QueryBuilder` gets this right with `push_bind` and is
+// explicit about why: the failure mode of the alternative is a list
+// and a string that agree today, a `WHERE` clause edited tomorrow, and
+// a query that binds the tenant id to the row limit.  Nothing warns.
+// Here that state has no spelling: there is no API that takes a
+// parameter list, and the list comes OUT of the render.
+//
+// ONE MODULE FOR THE WHOLE AST, because it is cyclic and modules are
+// not.  A `QbSelect` holds `QbExpr`s in its `WHERE`, and a `QbExpr`
+// holds a `QbSelect` in `QbInSelect` and `QbExists`.  sql-engine-nv's
+// `sqlast` makes the same call for the same reason, and splitting the
+// two would mean one of them carrying raw SQL text for the other —
+// which is the limitation sql-engine-nv's own README names as
+// novodb's, and not one to copy.
+//
+// VARIANT NAMES ARE PREFIXED, ALL OF THEM.  A variant is constructed
+// by name across the whole assembly, so an unprefixed `Select` or
+// `Eq` here would collide with sql-engine-nv's or with a consumer's
+// the first time one program used both.  `Qb` is the prefix and there
+// are no exceptions.
+//
+// NOTHING HERE RENDERS.  This module is the value; `qbrender` is the
+// only place a byte is written, and it writes into the caller's own
+// buffer.
+
+// A value bound into a query.
+//
+// Its own type rather than sql-engine-nv's `cell.Cell`, and that is
+// the reason this package has no dependencies: a builder that pulled
+// in a whole SQL engine to construct a string would be a builder
+// nobody uses against PostgreSQL.  The conversion to any driver's own
+// value type is one `match` in the caller, over six variants.
+pub enum QbValue
+    // SQL `NULL`.  A distinct variant rather than an absent value,
+    // because `x = NULL` and `x IS NULL` are different queries and a
+    // builder that conflated them would silently return no rows.
+    QbNull
+    // A signed 64-bit integer.
+    QbInt(v: Int)
+    // A double.
+    QbFloat(v: Float)
+    // Text.
+    QbText(v: Str)
+    // Bytes.  Rendered as the dialect's blob literal when inlined and
+    // passed through untouched when bound.
+    QbBlob(v: [u8])
+    // A boolean.  PostgreSQL has `TRUE`; SQLite and MySQL have `1`.
+    // `qbrender` knows which, and a caller writing `QbInt(1)` for a
+    // boolean column has given up that knowledge.
+    QbBool(v: Bool)
+
+// A comparison.
+pub enum QbCmpOp
+    QbEq
+    QbNe
+    QbLt
+    QbLe
+    QbGt
+    QbGe
+    // `IS DISTINCT FROM` — the comparison that treats two `NULL`s as
+    // equal, which is what a change-detection query wants and what
+    // `!=` cannot express.  MySQL spells it `<=>` and inverts the
+    // sense; `qbrender` handles that and `qbdialect` says so.
+    QbDistinct
+
+// An arithmetic or bitwise operator.
+pub enum QbBinOp
+    QbAdd
+    QbSub
+    QbMul
+    QbDiv
+    QbMod
+    // String concatenation.  `||` in SQLite, PostgreSQL and
+    // sql-engine-nv; MySQL needs `CONCAT(a, b)` unless
+    // `PIPES_AS_CONCAT` is set, which is a server setting this package
+    // cannot see — so MySQL renders the function call.
+    QbConcat
+    QbBitAnd
+    QbBitOr
+    QbShl
+    QbShr
+
+// How two nulls sort.
+pub enum QbNulls
+    // Whatever the dialect does by default.
+    QbNullsDefault
+    // `NULLS FIRST`.
+    QbNullsFirst
+    // `NULLS LAST`.
+    QbNullsLast
+
+// A join.
+pub enum QbJoinKind
+    QbInner
+    QbLeft
+    QbRight
+    QbFull
+    // `CROSS JOIN`, which takes no `ON`.
+    QbCross
+
+// A set operation between two selects.
+pub enum QbSetOp
+    QbUnion
+    QbUnionAll
+    QbIntersect
+    QbExcept
+
+// What to do when an insert hits a unique constraint.
+pub enum QbConflict
+    // Let the database raise it.
+    QbConflictError
+    // `ON CONFLICT DO NOTHING`, `INSERT IGNORE` in MySQL.
+    QbConflictIgnore
+    // `ON CONFLICT (cols) DO UPDATE SET …`, `ON DUPLICATE KEY UPDATE`
+    // in MySQL.  MySQL takes no conflict target — it uses whichever
+    // unique index was hit — so a statement naming one renders without
+    // it there and `qbrender.unsupported` says so before a caller
+    // relies on the target being honoured.
+    QbConflictUpdate
+
+// An expression.
+//
+// Everything a `WHERE`, a `HAVING`, a `SELECT` item, an `ON` clause,
+// an `ORDER BY` term and an assignment's right-hand side can be.  One
+// type for all of them, because SQL makes them one grammar and a
+// builder with six near-identical expression types is a builder whose
+// users write conversions.
+pub enum QbExpr
+    // A bare column name.
+    QbCol(name: Str)
+    // A column qualified by a table or an alias.
+    QbQual(table: Str, column: Str)
+    // `*`, for a `SELECT` item.
+    QbStar
+    // `table.*`.
+    QbQualStar(table: Str)
+    // A value bound as a parameter.  THE ONE TO USE for anything that
+    // came from outside the program.  The render assigns its position
+    // and emits the dialect's placeholder.
+    QbBind(value: QbValue)
+    // A value written into the SQL text.  For a constant the program
+    // wrote itself — a page size, a sentinel — where a parameter would
+    // stop the planner from seeing the number.  NEVER for anything a
+    // user supplied: an inlined `QbText` is escaped correctly by this
+    // package and is still a value in the query plan's text, which is
+    // the property parameters exist to avoid.
+    QbLit(value: QbValue)
+    // SQL written by hand, spliced in exactly.  The escape hatch, and
+    // the whole of this package's attack surface: nothing here parses
+    // it, escapes it or checks it, and a caller that builds one out of
+    // input has written the injection this package exists to prevent.
+    // `qbrender.raw_sites` counts them so a review can find them.
+    QbRaw(sql: Str)
+    // A comparison.
+    QbCmp(op: QbCmpOp, lhs: QbExpr, rhs: QbExpr)
+    // Arithmetic, concatenation or a bitwise operation.
+    QbBinop(op: QbBinOp, lhs: QbExpr, rhs: QbExpr)
+    QbAnd(lhs: QbExpr, rhs: QbExpr)
+    QbOr(lhs: QbExpr, rhs: QbExpr)
+    QbNot(operand: QbExpr)
+    // `IS NULL`, or `IS NOT NULL` when negated.
+    QbIsNull(operand: QbExpr, negated: Bool)
+    // `IN (…)`.  An EMPTY list is refused at render rather than
+    // emitted: `IN ()` is a syntax error in every dialect here, and
+    // the two repairs — `FALSE` and dropping the clause — mean
+    // opposite things, so choosing one for the caller would be
+    // choosing which rows they get.
+    QbIn(operand: QbExpr, values: [QbExpr], negated: Bool)
+    // `IN (SELECT …)`.
+    QbInSelect(operand: QbExpr, inner: QbSelect, negated: Bool)
+    // `BETWEEN low AND high`, inclusive at both ends.
+    QbBetween(operand: QbExpr, low: QbExpr, high: QbExpr, negated: Bool)
+    // `LIKE pattern`, with an `ESCAPE` clause when `escape` is not
+    // empty.  The pattern is an expression, so a bound one is bound.
+    QbLike(operand: QbExpr, pattern: QbExpr, escape: Str, negated: Bool)
+    // `ILIKE` — PostgreSQL only.  `qbrender.unsupported` names it for
+    // the other three rather than rendering `LIKE` and quietly
+    // changing which rows come back.
+    QbILike(operand: QbExpr, pattern: QbExpr, negated: Bool)
+    // A function call.  The name is written as given; nothing checks
+    // that the dialect has such a function.
+    QbFn(name: Str, args: [QbExpr])
+    // An aggregate, with `DISTINCT` and a `FILTER (WHERE …)` clause.
+    // Separate from `QbFn` because those two modifiers exist only here
+    // and folding them into the general call would put two fields
+    // nobody uses on every function in a query.
+    QbAgg(name: Str, args: [QbExpr], distinct: Bool, filter: ?QbExpr)
+    // `CAST(x AS ty)`.  `ty` is written as given, because the type
+    // names are the dialect's and this package does not translate
+    // them — `TEXT` is not `VARCHAR` is not `STRING`.
+    QbCast(operand: QbExpr, ty: Str)
+    // `CASE WHEN … THEN … ELSE … END`.  `whens` and `thens` are
+    // parallel and the render refuses a statement where they are not
+    // the same length.
+    QbCase(whens: [QbExpr], thens: [QbExpr], otherwise: ?QbExpr)
+    // `COALESCE(…)`.
+    QbCoalesce(args: [QbExpr])
+    // `EXISTS (SELECT …)`, or `NOT EXISTS`.
+    QbExists(inner: QbSelect, negated: Bool)
+    // A scalar subquery used where a value belongs.
+    QbScalar(inner: QbSelect)
+
+// A `SELECT` item, with an optional alias.
+pub struct QbColumn
+    // What is selected.
+    expr: QbExpr
+    // The `AS` name, or empty.
+    as_name: Str
+
+// Where a `SELECT` reads from.
+pub enum QbSource
+    // A table, with an optional alias.
+    QbTable(name: Str, as_name: Str)
+    // A subquery.  The alias is REQUIRED by PostgreSQL and MySQL and
+    // optional in SQLite, so an empty one is a refusal for the first
+    // two and `qbrender.unsupported` names it.
+    QbSubquery(inner: QbSelect, as_name: Str)
+    // A CTE by name, with an optional alias.
+    QbCteRef(name: String, as_name: Str)
+
+// One join in a `SELECT`.
+pub struct QbJoin
+    // Which kind.
+    kind: QbJoinKind
+    // What is joined.
+    source: QbSource
+    // The `ON` condition.  `None` for a `CROSS JOIN`, which takes
+    // none; a `None` on any other kind is refused at render, because
+    // an inner join with no condition is a cross join written by
+    // accident and is the single most expensive typo in SQL.
+    on: ?QbExpr
+
+// One `ORDER BY` term.
+pub struct QbOrder
+    // What to sort by.
+    expr: QbExpr
+    // `DESC` when true.
+    descending: Bool
+    // Where nulls go.
+    nulls: QbNulls
+
+// One common table expression.
+pub struct QbCte
+    // The name it is referred to by.
+    name: Str
+    // The columns it exposes, or empty to take the body's.
+    columns: [Str]
+    // The body.
+    body: QbSelect
+    // `WITH RECURSIVE` when true.  One recursive CTE in a statement
+    // makes the whole `WITH` recursive, which is a fact about the
+    // keyword rather than about this CTE, and the render collects it.
+    recursive: Bool
+
+// One arm of a set operation.
+pub struct QbSetArm
+    // Which operation joins this arm to the one before it.
+    op: QbSetOp
+    // The select.
+    body: QbSelect
+
+// A `SELECT`.
+pub struct QbSelect
+    // `WITH` clauses, in order.
+    ctes: [QbCte]
+    // `SELECT DISTINCT` when true.
+    distinct: Bool
+    // `DISTINCT ON (…)` — PostgreSQL only, and named by
+    // `qbrender.unsupported` for the others rather than dropped.
+    distinct_on: [QbExpr]
+    // What is selected.  An empty list renders `SELECT *`, because a
+    // select with no items is not a statement any dialect accepts and
+    // `*` is what a caller who named nothing meant.
+    columns: [QbColumn]
+    // What it reads from.  `None` is a `SELECT` with no `FROM`, which
+    // every dialect here allows and which is how a caller computes an
+    // expression.
+    from: ?QbSource
+    // Joins, applied in order.
+    joins: [QbJoin]
+    // The `WHERE` condition.
+    where_: ?QbExpr
+    // `GROUP BY` terms.
+    group_by: [QbExpr]
+    // The `HAVING` condition.
+    having: ?QbExpr
+    // `ORDER BY` terms.
+    order_by: [QbOrder]
+    // `LIMIT n`, or `-1` for none.
+    limit: Int
+    // `OFFSET n`, or `-1` for none.  An offset with no limit is legal
+    // in PostgreSQL and needs `LIMIT -1` in SQLite; the render writes
+    // whichever the dialect needs.
+    offset: Int
+    // `UNION` and friends, applied left to right after this select.
+    set_arms: [QbSetArm]
+    // `FOR UPDATE` when true.  Not in SQLite, and named rather than
+    // dropped.
+    for_update: Bool
+
+// An `INSERT`.
+pub struct QbInsert
+    // `WITH` clauses.
+    ctes: [QbCte]
+    // The table.
+    table: Str
+    // The columns written.  An empty list is refused at render: an
+    // `INSERT` with no column list depends on the table's declaration
+    // order, which a builder cannot see and which changes when
+    // somebody adds a column.
+    columns: [Str]
+    // The rows, each a list the same length as `columns`.  A row of a
+    // different length is refused at render with both numbers named.
+    rows: [[QbExpr]]
+    // `INSERT … SELECT` instead of `VALUES`.  When present, `rows` is
+    // ignored and the render refuses a statement that set both.
+    from_select: ?QbSelect
+    // What to do on a unique-constraint conflict.
+    conflict: QbConflict
+    // The columns naming the conflict target, for `QbConflictIgnore`
+    // and `QbConflictUpdate`.
+    conflict_columns: [Str]
+    // The assignments for `QbConflictUpdate`.
+    conflict_set: [QbAssign]
+    // A condition on the `DO UPDATE`, PostgreSQL and SQLite only.
+    conflict_where: ?QbExpr
+    // `RETURNING` items.  PostgreSQL and SQLite; MySQL has none and
+    // `qbrender.unsupported` says so.
+    returning: [QbColumn]
+
+// One `SET column = expr`.
+pub struct QbAssign
+    // The column.
+    column: Str
+    // What it becomes.
+    value: QbExpr
+
+// An `UPDATE`.
+pub struct QbUpdate
+    // `WITH` clauses.
+    ctes: [QbCte]
+    // The table.
+    table: Str
+    // The assignments.  An empty list is refused at render.
+    set: [QbAssign]
+    // `FROM` — PostgreSQL's extension, which SQLite also has since
+    // 3.33 and MySQL spells as a multi-table update.
+    from: ?QbSource
+    // The condition.  `None` UPDATES EVERY ROW, and that is stated
+    // here rather than refused, because "set every row's flag" is a
+    // real statement; `qbrender.unguarded` is the check a review runs.
+    where_: ?QbExpr
+    // `RETURNING` items.
+    returning: [QbColumn]
+
+// A `DELETE`.
+pub struct QbDelete
+    // `WITH` clauses.
+    ctes: [QbCte]
+    // The table.
+    table: Str
+    // The condition.  `None` DELETES EVERY ROW; see `QbUpdate.where_`.
+    where_: ?QbExpr
+    // `RETURNING` items.
+    returning: [QbColumn]
+
+// Any of the four.
+pub enum QbStmt
+    QbStmtSelect(body: QbSelect)
+    QbStmtInsert(body: QbInsert)
+    QbStmtUpdate(body: QbUpdate)
+    QbStmtDelete(body: QbDelete)
+
+// The table a statement writes to, or the empty string for a `SELECT`.
+//
+// What an audit log, a permission check and a cache invalidation all
+// ask, and the one question about a statement that should not require
+// a `match` at every call site.
+//
+// ```novo
+// use qbast
+// use qbbuild
+//
+// fn main() [io]
+//     println("[${qbast.target_table(QbStmtSelect(qbbuild.select()))}]")
+// ```
+pub fn target_table(s: QbStmt) -> Str []
+    todo("query-builder-nv.qbast.target_table")
+
+// True when the statement changes rows.
+//
+// ```novo
+// use qbast
+// use qbbuild
+//
+// fn main() [io]
+//     println("${qbast.is_write(QbStmtSelect(qbbuild.select()))}")
+// ```
+pub fn is_write(s: QbStmt) -> Bool []
+    todo("query-builder-nv.qbast.is_write")
+
+// Every table a statement reads or writes, including through its
+// joins, its subqueries and its CTEs, in the order they appear and
+// with duplicates removed.
+//
+// What a permission check needs, and what a caller walking the tree by
+// hand gets wrong the first time somebody nests a subquery in a CTE.
+//
+// ```novo
+// use std.list
+// use qbast
+// use qbbuild
+//
+// fn main() [io]
+//     println("${list.len(qbast.tables_of(QbStmtSelect(qbbuild.select())))}")
+// ```
+pub fn tables_of(s: QbStmt) -> [Str] []
+    todo("query-builder-nv.qbast.tables_of")
+
+// Every value the statement would bind, in the order `qbrender` would
+// assign them positions.
+//
+// The same walk the render makes, without the text — for a caller that
+// wants to log or redact the parameters before the query runs.
+//
+// ```novo
+// use std.list
+// use qbast
+// use qbbuild
+//
+// fn main() [io]
+//     println("${list.len(qbast.binds_of(QbStmtSelect(qbbuild.select())))}")
+// ```
+pub fn binds_of(s: QbStmt) -> [QbValue] []
+    todo("query-builder-nv.qbast.binds_of")
+
+// How many `QbRaw` expressions the statement contains.
+//
+// Every one of them is SQL this package did not build, escape or
+// check.  A review that wants to know whether a query is machine-built
+// asks this and expects zero; a build that wants to forbid the escape
+// hatch asserts it.
+//
+// ```novo
+// use qbast
+// use qbbuild
+//
+// fn main() [io]
+//     println("${qbast.raw_count(QbStmtSelect(qbbuild.select()))}")
+// ```
+pub fn raw_count(s: QbStmt) -> Int []
+    todo("query-builder-nv.qbast.raw_count")
+
+// How deep the statement nests subqueries.
+//
+// A depth of zero is a flat statement.  Published because a builder
+// assembling a query out of user-supplied filters can produce
+// arbitrarily deep nesting, and a database's own limit is reached long
+// after the interesting point.
+//
+// ```novo
+// use qbast
+// use qbbuild
+//
+// fn main() [io]
+//     println("${qbast.depth(QbStmtSelect(qbbuild.select()))}")
+// ```
+pub fn depth(s: QbStmt) -> Int []
+    todo("query-builder-nv.qbast.depth")

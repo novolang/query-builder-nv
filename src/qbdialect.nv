@@ -1,0 +1,292 @@
+// qbdialect.nv — the four dialects, and the facts that differ between
+// them.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A DIALECT IS A TABLE, NOT A BRANCH.  Every place the four disagree
+// is a function here answering one fact, and `qbrender` reads them.
+// The alternative — a `match d` at each of forty sites — is how a
+// renderer ends up supporting three dialects properly and the fourth
+// almost, with nothing saying which sites were missed.  A table has a
+// row per fact and the rows are testable one at a time.
+//
+// THE FOUR, AND WHY THESE FOUR
+//
+//   QbSqlEngine   sql-engine-nv's, which is the dialect novodb and
+//                 pager-nv execute.  A SQLite subset with two gaps
+//                 this module reports: no quoted identifiers at all,
+//                 and no comment syntax.
+//   QbSqlite      SQLite proper.
+//   QbPostgres    PostgreSQL.
+//   QbMysql       MySQL and MariaDB.
+//
+// THE PLACEHOLDER IS THE OBVIOUS DIFFERENCE AND THE LEAST INTERESTING
+// ONE.  `?` for three of them and `$1`, `$2` for PostgreSQL: that is
+// two lines.  What actually costs a day is the quoting — `"` for three
+// and a backtick for MySQL, doubled to escape itself, and NOT
+// AVAILABLE AT ALL in sql-engine-nv's, whose lexer recognises neither
+// spelling.  A query builder that assumed it could always quote an
+// identifier would produce, for the sql-engine dialect, SQL that
+// lexes as two tokens where one was meant.
+
+// Which SQL is being written.
+pub enum QbDialect
+    // sql-engine-nv's dialect — what novodb and pager-nv execute.
+    QbSqlEngine
+    // SQLite.
+    QbSqlite
+    // PostgreSQL.
+    QbPostgres
+    // MySQL and MariaDB.
+    QbMysql
+
+// A thing a dialect may or may not have.
+//
+// `supports` is total over this enum, so adding a dialect is a column
+// and adding a feature is a row, and neither is a search through
+// `qbrender`.
+pub enum QbFeature
+    // An identifier can be quoted, so a column named `select` or
+    // `user name` can be spelled.  FALSE for `QbSqlEngine`, whose
+    // lexer recognises neither `"` nor a backtick around a name.
+    QbFeatQuotedIdent
+    // `WITH … AS (…)`.
+    QbFeatCte
+    // `WITH RECURSIVE`.
+    QbFeatRecursiveCte
+    // `ON CONFLICT` or `ON DUPLICATE KEY UPDATE`.
+    QbFeatUpsert
+    // A conflict TARGET on an upsert — the `(col, …)` after
+    // `ON CONFLICT`.  True for SQLite and PostgreSQL; MySQL uses
+    // whichever unique index was hit and has no way to name one, so a
+    // statement that named a target is rendered without it and
+    // `qbrender.unsupported` says so.
+    QbFeatConflictTarget
+    // `RETURNING`.
+    QbFeatReturning
+    // `ILIKE`.
+    QbFeatILike
+    // `DISTINCT ON`.
+    QbFeatDistinctOn
+    // `FULL OUTER JOIN`.
+    QbFeatFullJoin
+    // `RIGHT JOIN`.  SQLite has had it only since 3.39, and this
+    // package cannot see a server's version, so the SQLite row says
+    // true and the README names the floor.
+    QbFeatRightJoin
+    // `TRUE` and `FALSE` as literals.  PostgreSQL has them; the other
+    // three take `1` and `0`.
+    QbFeatBooleanLiteral
+    // `IS DISTINCT FROM`.  MySQL spells it `<=>` with the opposite
+    // sense, which `qbrender` writes correctly; the row is here so a
+    // caller can see that a translation happened.
+    QbFeatIsDistinctFrom
+    // `NULLS FIRST` and `NULLS LAST` on an `ORDER BY` term.  MySQL has
+    // neither.
+    QbFeatNullsOrdering
+    // `OFFSET` with no `LIMIT`.  SQLite needs `LIMIT -1` in front of
+    // one, which `qbrender` writes.
+    QbFeatBareOffset
+    // `FOR UPDATE`.  Not SQLite.
+    QbFeatForUpdate
+    // A subquery in `FROM` may omit its alias.  SQLite only.
+    QbFeatAnonymousSubquery
+    // `--` and `/* … */`.  FALSE for `QbSqlEngine`, whose lexer reads
+    // `--` as two minus operators — so a rendered statement carrying a
+    // comment would not merely be ugly, it would fail to parse.
+    QbFeatComment
+    // A parameter placeholder of any spelling.  FALSE for
+    // `QbSqlEngine` today: its token set has no `?`, so a statement
+    // with a bind cannot be executed by it as written.  See the README.
+    QbFeatParameters
+
+// Whether `d` has `f`.
+//
+// Total over both enums, which is what makes the table a table.
+//
+// ```novo
+// use qbdialect
+//
+// fn main() [io]
+//     println("${qbdialect.supports(QbPostgres, QbFeatILike)}")
+// ```
+pub fn supports(d: QbDialect, f: QbFeature) -> Bool []
+    todo("query-builder-nv.qbdialect.supports")
+
+// The dialect's name, as it appears in a fault message: `sql-engine`,
+// `sqlite`, `postgres`, `mysql`.
+//
+// ```novo
+// use qbdialect
+//
+// fn main() [io]
+//     println(qbdialect.name(QbPostgres))
+// ```
+pub fn name(d: QbDialect) -> Str []
+    todo("query-builder-nv.qbdialect.name")
+
+// The short name of a feature, for a fault message and a report:
+// `quoted-ident`, `returning`, `distinct-on`.
+//
+// ```novo
+// use qbdialect
+//
+// fn main() [io]
+//     println(qbdialect.feature_name(QbFeatDistinctOn))
+// ```
+pub fn feature_name(f: QbFeature) -> Str []
+    todo("query-builder-nv.qbdialect.feature_name")
+
+// Every feature, so a caller can print the whole table or diff two
+// dialects.
+//
+// ```novo
+// use std.list
+// use qbdialect
+//
+// fn main() [io]
+//     println("${list.len(qbdialect.features())}")
+// ```
+pub fn features() -> [QbFeature] []
+    todo("query-builder-nv.qbdialect.features")
+
+// Every dialect.
+//
+// ```novo
+// use std.list
+// use qbdialect
+//
+// fn main() [io]
+//     println("${list.len(qbdialect.dialects())}")
+// ```
+pub fn dialects() -> [QbDialect] []
+    todo("query-builder-nv.qbdialect.dialects")
+
+// The placeholder for the `n`th bound parameter, counting from ZERO.
+//
+// `?` for SQLite, MySQL and sql-engine-nv whatever `n` is; `$1` for
+// PostgreSQL's `n = 0`.  Counting from zero here and printing from one
+// for PostgreSQL is the off-by-one this function exists to contain: it
+// happens once, in one place, with a test.
+//
+// ```novo
+// use qbdialect
+//
+// fn main() [io]
+//     println(qbdialect.placeholder(QbPostgres, 0))
+// ```
+pub fn placeholder(d: QbDialect, n: Int) -> Str []
+    todo("query-builder-nv.qbdialect.placeholder")
+
+// The character an identifier is quoted with: `34` for `"`, `96` for a
+// backtick, and `0` for a dialect that cannot quote one.
+//
+// ```novo
+// use qbdialect
+//
+// fn main() [io]
+//     println("${qbdialect.quote_char(QbMysql)}")
+// ```
+pub fn quote_char(d: QbDialect) -> Int []
+    todo("query-builder-nv.qbdialect.quote_char")
+
+// Whether `name` can be written unquoted in `d` — a leading letter or
+// underscore, then letters, digits and underscores, and not a reserved
+// word.
+//
+// For a dialect that cannot quote at all, this is the whole of what
+// its identifiers may be, and a `false` here is a refusal rather than
+// a signal to add quotes.
+//
+// ```novo
+// use qbdialect
+//
+// fn main() [io]
+//     println("${qbdialect.is_bare_ident(QbPostgres, "user_id")}")
+// ```
+pub fn is_bare_ident(d: QbDialect, name: Str) -> Bool []
+    todo("query-builder-nv.qbdialect.is_bare_ident")
+
+// Whether `word` is reserved in `d`, compared case-insensitively.
+//
+// The lists differ by more than people expect — `user` is reserved in
+// PostgreSQL and not in SQLite, `rank` in MySQL 8 and not before it —
+// which is why a builder that quoted everything would be right and
+// unreadable, and why one that quoted nothing would be wrong.
+//
+// ```novo
+// use qbdialect
+//
+// fn main() [io]
+//     println("${qbdialect.is_reserved(QbPostgres, "user")}")
+// ```
+pub fn is_reserved(d: QbDialect, word: Str) -> Bool []
+    todo("query-builder-nv.qbdialect.is_reserved")
+
+// The reserved words of `d`, upper case, in alphabetical order.
+//
+// Published so a schema tool can check a migration's column names
+// against the dialect it targets before the migration runs.
+//
+// ```novo
+// use std.list
+// use qbdialect
+//
+// fn main() [io]
+//     println("${list.len(qbdialect.reserved_words(QbSqlite))}")
+// ```
+pub fn reserved_words(d: QbDialect) -> [Str] []
+    todo("query-builder-nv.qbdialect.reserved_words")
+
+// How `d` writes a boolean: `TRUE` / `FALSE` for PostgreSQL, `1` / `0`
+// for the rest.
+//
+// ```novo
+// use qbdialect
+//
+// fn main() [io]
+//     println(qbdialect.boolean_literal(QbSqlite, true))
+// ```
+pub fn boolean_literal(d: QbDialect, v: Bool) -> Str []
+    todo("query-builder-nv.qbdialect.boolean_literal")
+
+// How `d` opens a blob literal — `X'` for three of them and `0x` for
+// MySQL — paired with `blob_suffix`.
+//
+// ```novo
+// use qbdialect
+//
+// fn main() [io]
+//     println(qbdialect.blob_prefix(QbSqlite))
+// ```
+pub fn blob_prefix(d: QbDialect) -> Str []
+    todo("query-builder-nv.qbdialect.blob_prefix")
+
+// How `d` closes a blob literal: `'` for three and empty for MySQL.
+//
+// ```novo
+// use qbdialect
+//
+// fn main() [io]
+//     println("[${qbdialect.blob_suffix(QbMysql)}]")
+// ```
+pub fn blob_suffix(d: QbDialect) -> Str []
+    todo("query-builder-nv.qbdialect.blob_suffix")
+
+// Whether a backslash inside a single-quoted string is an escape
+// character in `d`.
+//
+// TRUE for MySQL by default and false for the other three, which is
+// the difference that makes a string escaper written for one dialect
+// wrong for the other — `'a\'` is a complete string in PostgreSQL and
+// an unterminated one in MySQL.  `qbrender` doubles the backslash
+// where this says so.
+//
+// ```novo
+// use qbdialect
+//
+// fn main() [io]
+//     println("${qbdialect.backslash_escapes(QbMysql)}")
+// ```
+pub fn backslash_escapes(d: QbDialect) -> Bool []
+    todo("query-builder-nv.qbdialect.backslash_escapes")

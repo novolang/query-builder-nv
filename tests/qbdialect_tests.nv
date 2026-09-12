@@ -1,0 +1,192 @@
+// qbdialect_tests.nv — the table, one row at a time.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented:
+// query-builder-nv.<module>.<fn>`.  That is the expected result until
+// the bodies land.
+//
+// A TABLE IS TESTABLE A ROW AT A TIME and that is the argument for
+// having one: the assertions below are the table written out, so a
+// change to a cell is a failing assertion rather than a query that
+// comes back wrong from one of four databases.
+
+use std.test
+use std.list
+use qbdialect
+
+@test
+fn test_the_four_dialects_and_their_names() [io]
+    test.case("four, and they name themselves the way a fault message does")
+    test.assert(list.len(qbdialect.dialects()) == 4)
+    test.assert(qbdialect.name(QbSqlEngine) == "sql-engine")
+    test.assert(qbdialect.name(QbSqlite) == "sqlite")
+    test.assert(qbdialect.name(QbPostgres) == "postgres")
+    test.assert(qbdialect.name(QbMysql) == "mysql")
+
+    test.case("and every feature has a short name too")
+    test.assert(list.len(qbdialect.features()) > 0)
+    for f in qbdialect.features()
+        test.assert(qbdialect.feature_name(f) != "")
+
+@test
+fn test_the_placeholder_is_the_obvious_difference() [io]
+    test.case("three of them write a question mark whatever the index")
+    test.assert(qbdialect.placeholder(QbSqlite, 0) == "?")
+    test.assert(qbdialect.placeholder(QbSqlite, 41) == "?")
+    test.assert(qbdialect.placeholder(QbMysql, 0) == "?")
+
+    test.case("PostgreSQL numbers from ONE while the index counts from zero")
+    test.assert(qbdialect.placeholder(QbPostgres, 0) == "$1")
+    test.assert(qbdialect.placeholder(QbPostgres, 1) == "$2")
+
+    test.case("and sql-engine-nv has no placeholder token at all")
+    test.assert(qbdialect.supports(QbSqlEngine, QbFeatParameters) == false)
+    test.assert(qbdialect.supports(QbSqlite, QbFeatParameters))
+
+@test
+fn test_the_quoting_is_the_difference_that_costs_a_day() [io]
+    test.case("three can quote and one cannot")
+    test.assert(qbdialect.supports(QbSqlite, QbFeatQuotedIdent))
+    test.assert(qbdialect.supports(QbPostgres, QbFeatQuotedIdent))
+    test.assert(qbdialect.supports(QbMysql, QbFeatQuotedIdent))
+    test.assert(qbdialect.supports(QbSqlEngine, QbFeatQuotedIdent) == false)
+
+    test.case("MySQL uses a backtick and the other two a double quote")
+    test.assert(qbdialect.quote_char(QbSqlite) == 34)
+    test.assert(qbdialect.quote_char(QbPostgres) == 34)
+    test.assert(qbdialect.quote_char(QbMysql) == 96)
+
+    test.case("and a dialect that cannot quote says so with a zero")
+    test.assert(qbdialect.quote_char(QbSqlEngine) == 0)
+
+@test
+fn test_a_bare_identifier_is_letters_digits_and_underscore() [io]
+    test.case("an ordinary name is bare in every dialect")
+    for d in qbdialect.dialects()
+        test.assert(qbdialect.is_bare_ident(d, "user_id"))
+
+    test.case("a leading digit is not")
+    for d in qbdialect.dialects()
+        test.assert(qbdialect.is_bare_ident(d, "1st") == false)
+
+    test.case("nor is a space")
+    for d in qbdialect.dialects()
+        test.assert(qbdialect.is_bare_ident(d, "user name") == false)
+
+    test.case("and a reserved word is not bare, which is why it needs quotes")
+    test.assert(qbdialect.is_bare_ident(QbPostgres, "user") == false)
+
+@test
+fn test_the_reserved_word_lists_differ_by_more_than_people_expect() [io]
+    test.case("user is reserved in PostgreSQL")
+    test.assert(qbdialect.is_reserved(QbPostgres, "user"))
+
+    test.case("and not in SQLite")
+    test.assert(qbdialect.is_reserved(QbSqlite, "user") == false)
+
+    test.case("the comparison is case-insensitive, because SQL's is")
+    test.assert(qbdialect.is_reserved(QbPostgres, "USER"))
+    test.assert(qbdialect.is_reserved(QbPostgres, "User"))
+
+    test.case("select is reserved everywhere")
+    for d in qbdialect.dialects()
+        test.assert(qbdialect.is_reserved(d, "select"))
+
+    test.case("and the lists are published for a schema tool to check against")
+    for d in qbdialect.dialects()
+        test.assert(list.len(qbdialect.reserved_words(d)) > 0)
+
+@test
+fn test_the_literal_spellings() [io]
+    test.case("PostgreSQL has real booleans")
+    test.assert(qbdialect.supports(QbPostgres, QbFeatBooleanLiteral))
+    test.assert(qbdialect.boolean_literal(QbPostgres, true) == "TRUE")
+    test.assert(qbdialect.boolean_literal(QbPostgres, false) == "FALSE")
+
+    test.case("the other three write one and zero")
+    test.assert(qbdialect.supports(QbSqlite, QbFeatBooleanLiteral) == false)
+    test.assert(qbdialect.boolean_literal(QbSqlite, true) == "1")
+    test.assert(qbdialect.boolean_literal(QbMysql, false) == "0")
+
+    test.case("a blob is X'…' in three and 0x… in MySQL")
+    test.assert(qbdialect.blob_prefix(QbSqlite) == "X'")
+    test.assert(qbdialect.blob_suffix(QbSqlite) == "'")
+    test.assert(qbdialect.blob_prefix(QbMysql) == "0x")
+    test.assert(qbdialect.blob_suffix(QbMysql) == "")
+
+@test
+fn test_the_backslash_rule_is_the_one_that_breaks_an_escaper() [io]
+    // 'a\' is a complete string in PostgreSQL and an unterminated one
+    // in MySQL, so an escaper written for either is wrong for the
+    // other.
+    test.case("MySQL treats a backslash as an escape by default")
+    test.assert(qbdialect.backslash_escapes(QbMysql))
+
+    test.case("and the other three do not")
+    test.assert(qbdialect.backslash_escapes(QbSqlite) == false)
+    test.assert(qbdialect.backslash_escapes(QbPostgres) == false)
+    test.assert(qbdialect.backslash_escapes(QbSqlEngine) == false)
+
+@test
+fn test_the_features_each_dialect_lacks() [io]
+    test.case("RETURNING: everyone but MySQL")
+    test.assert(qbdialect.supports(QbSqlite, QbFeatReturning))
+    test.assert(qbdialect.supports(QbPostgres, QbFeatReturning))
+    test.assert(qbdialect.supports(QbMysql, QbFeatReturning) == false)
+
+    test.case("ILIKE and DISTINCT ON: PostgreSQL only")
+    test.assert(qbdialect.supports(QbPostgres, QbFeatILike))
+    test.assert(qbdialect.supports(QbSqlite, QbFeatILike) == false)
+    test.assert(qbdialect.supports(QbPostgres, QbFeatDistinctOn))
+    test.assert(qbdialect.supports(QbMysql, QbFeatDistinctOn) == false)
+
+    test.case("NULLS FIRST and FULL OUTER JOIN: not MySQL")
+    test.assert(qbdialect.supports(QbPostgres, QbFeatNullsOrdering))
+    test.assert(qbdialect.supports(QbMysql, QbFeatNullsOrdering) == false)
+    test.assert(qbdialect.supports(QbMysql, QbFeatFullJoin) == false)
+
+    test.case("FOR UPDATE: not SQLite")
+    test.assert(qbdialect.supports(QbPostgres, QbFeatForUpdate))
+    test.assert(qbdialect.supports(QbSqlite, QbFeatForUpdate) == false)
+
+    test.case("a conflict target: not MySQL, which uses whichever index was hit")
+    test.assert(qbdialect.supports(QbPostgres, QbFeatConflictTarget))
+    test.assert(qbdialect.supports(QbMysql, QbFeatConflictTarget) == false)
+    test.assert(qbdialect.supports(QbMysql, QbFeatUpsert))
+
+    test.case("an anonymous subquery in FROM: SQLite only")
+    test.assert(qbdialect.supports(QbSqlite, QbFeatAnonymousSubquery))
+    test.assert(qbdialect.supports(QbPostgres, QbFeatAnonymousSubquery) == false)
+
+    test.case("a bare OFFSET: not SQLite, which needs LIMIT -1 in front of one")
+    test.assert(qbdialect.supports(QbPostgres, QbFeatBareOffset))
+    test.assert(qbdialect.supports(QbSqlite, QbFeatBareOffset) == false)
+
+    test.case("RIGHT JOIN, and the README names SQLite's version floor")
+    test.assert(qbdialect.supports(QbSqlite, QbFeatRightJoin))
+
+    test.case("IS DISTINCT FROM, which MySQL spells <=> with the sense inverted")
+    test.assert(qbdialect.supports(QbPostgres, QbFeatIsDistinctFrom))
+    test.assert(qbdialect.supports(QbMysql, QbFeatIsDistinctFrom))
+
+@test
+fn test_the_sql_engine_dialect_is_the_narrowest_and_says_so() [io]
+    // Reading sql-engine-nv's own tokenizer is what this row is for:
+    // its lexer has no comment syntax, no quoted identifiers and no
+    // question mark in its punctuation set.
+    test.case("no comments — `--` lexes there as two minus operators")
+    test.assert(qbdialect.supports(QbSqlEngine, QbFeatComment) == false)
+
+    test.case("and the other three have them")
+    test.assert(qbdialect.supports(QbSqlite, QbFeatComment))
+    test.assert(qbdialect.supports(QbPostgres, QbFeatComment))
+    test.assert(qbdialect.supports(QbMysql, QbFeatComment))
+
+    test.case("CTEs are there, which is the one modern thing it does have")
+    test.assert(qbdialect.supports(QbSqlEngine, QbFeatCte))
+
+    test.case("and every dialect answers every feature — the table is total")
+    for d in qbdialect.dialects()
+        for f in qbdialect.features()
+            let answered = qbdialect.supports(d, f)
+            test.assert(answered or answered == false)

@@ -1,0 +1,343 @@
+// qbrender.nv — the statement out as bytes, with the parameters
+// beside them.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// NOTHING HERE WRITES.  Every function takes the buffer to append to
+// and answers it back, so a caller building a batch of statements
+// keeps one buffer and a test asserts on bytes with no database in the
+// room.  `docs/publishing.md` § Design is explicit that a library
+// returns the text or takes the writer, and this package has no
+// effects with which to do otherwise.
+//
+// THE PARAMETER LIST COMES OUT, NEVER IN.  `render` walks the tree and
+// assigns a position to each `QbBind` as it meets it, in the order the
+// dialect's placeholders appear, and answers the list beside the
+// bytes.  A caller cannot get the two out of step because it never
+// wrote either.  This is the whole point of the package and every
+// signature here is arranged around it.
+//
+// THE RENDER IS THE VALIDATOR.  There is no separate `validate` pass:
+// the walk that emits the bytes is the walk that finds the join with
+// no `ON`, and a statement that renders is a statement that was well
+// formed.  `check` is the same walk stopping short of the buffer, for
+// a caller that wants every fault rather than the first — because
+// `render` stops at the first, which is what a caller executing a
+// query wants, and a linter wants the other thing.
+//
+// EVERY DIALECT DIFFERENCE IS A `qbdialect` CALL.  There is no `match
+// d` in this module's design beyond what the table cannot express;
+// see that module's head comment for why.
+
+use qbast
+use qbdialect
+use qberror
+
+// What a render is allowed to do and what it is bounded by.
+pub struct QbRenderOptions
+    // Which SQL to write.
+    dialect: qbdialect.QbDialect
+    // Write newlines and indentation between clauses.  False writes
+    // one line, which is what goes to a server; true is what goes in a
+    // log a person reads.
+    pretty: Bool
+    // Quote every identifier, rather than only the ones that need it.
+    // False is the default and produces readable SQL; true is what a
+    // caller whose column names came from a schema they do not control
+    // wants.  A dialect that cannot quote refuses this rather than
+    // ignoring it.
+    quote_all: Bool
+    // Refuse an `UPDATE` or `DELETE` with no `WHERE`.  False by
+    // default, because those statements are real; a caller that runs
+    // user-driven queries sets it and gets a fault instead of an empty
+    // table.
+    require_where: Bool
+    // Refuse a statement containing a `QbRaw`.  The switch a build
+    // turns on when it wants to prove no query in the program was
+    // assembled by hand.
+    forbid_raw: Bool
+    // Refuse nesting deeper than this.  64 by default.
+    max_depth: Int
+    // Refuse more than this many bound parameters.  Every driver has a
+    // ceiling — PostgreSQL's wire protocol has 65 535 — and a query
+    // built from an unbounded list reaches it as a server error rather
+    // than as a fault here.  Default 65 535.
+    max_params: Int
+
+// What a render produced.
+pub struct QbRender
+    // The buffer, with the statement appended.
+    text: [u8]
+    // The values, in the order their placeholders appear.  Hand this
+    // to the driver exactly as it is; the order is the render's and
+    // reordering it is how a query binds the tenant id to the row
+    // limit.
+    params: [qbast.QbValue]
+
+// The defaults for a dialect: not pretty, quote only what needs it,
+// allow an unguarded write, allow raw, depth 64, 65 535 parameters.
+//
+// ```novo
+// use qbrender
+//
+// fn main() [io]
+//     println("${qbrender.options(QbPostgres).max_depth}")
+// ```
+pub fn options(d: qbdialect.QbDialect) -> QbRenderOptions []
+    todo("query-builder-nv.qbrender.options")
+
+// `o` with pretty-printing on.
+//
+// ```novo
+// use qbrender
+//
+// fn main() [io]
+//     println("${qbrender.with_pretty(qbrender.options(QbSqlite), true).pretty}")
+// ```
+pub fn with_pretty(o: QbRenderOptions, pretty: Bool) -> QbRenderOptions []
+    todo("query-builder-nv.qbrender.with_pretty")
+
+// `o` refusing an `UPDATE` or `DELETE` with no `WHERE`.
+//
+// ```novo
+// use qbrender
+//
+// fn main() [io]
+//     let o = qbrender.with_require_where(qbrender.options(QbSqlite), true)
+//     println("${o.require_where}")
+// ```
+pub fn with_require_where(o: QbRenderOptions, require: Bool) -> QbRenderOptions []
+    todo("query-builder-nv.qbrender.with_require_where")
+
+// `o` refusing a statement that contains a `QbRaw`.
+//
+// ```novo
+// use qbrender
+//
+// fn main() [io]
+//     let o = qbrender.with_forbid_raw(qbrender.options(QbSqlite), true)
+//     println("${o.forbid_raw}")
+// ```
+pub fn with_forbid_raw(o: QbRenderOptions, forbid: Bool) -> QbRenderOptions []
+    todo("query-builder-nv.qbrender.with_forbid_raw")
+
+// A statement appended to `out`, with its parameters.
+//
+// The one call the package exists for.  Stops at the first fault,
+// which is what a caller about to execute wants; `check` answers all
+// of them.
+//
+// ```novo
+// use std.list
+// use qbast
+// use qbbuild
+// use qbrender
+//
+// fn main() [io]
+//     let s = qbbuild.from(qbbuild.select(), "users", "")
+//     match qbrender.render([], QbStmtSelect(s), qbrender.options(QbSqlite))
+//         Ok(r)  => println("${list.len(r.text)}")
+//         Err(_) => println("no")
+// ```
+pub fn render(out: [u8], s: qbast.QbStmt,
+              o: QbRenderOptions) -> Result<QbRender, qberror.QbFault> []
+    todo("query-builder-nv.qbrender.render")
+
+// A statement as a string, with its parameters — the convenience over
+// `render` for a caller that is not batching.
+//
+// ```novo
+// use qbast
+// use qbbuild
+// use qbrender
+//
+// fn main() [io]
+//     let s = qbbuild.from(qbbuild.select(), "users", "")
+//     match qbrender.render_str(QbStmtSelect(s), qbrender.options(QbSqlite))
+//         Ok(r)  => println("${r.params}")
+//         Err(_) => println("no")
+// ```
+pub fn render_str(s: qbast.QbStmt, o: QbRenderOptions) -> Result<QbRenderedText, qberror.QbFault> []
+    todo("query-builder-nv.qbrender.render_str")
+
+// A rendered statement as text.
+pub struct QbRenderedText
+    // The SQL.
+    sql: Str
+    // The values, in placeholder order.
+    params: [qbast.QbValue]
+
+// One expression appended to `out`, with its parameters numbered from
+// `first_param`.
+//
+// The door for a caller splicing a condition into SQL it wrote itself
+// — a migration, a view body — who needs the numbering to continue
+// from where their own placeholders left off.  Getting that number
+// wrong is the failure this signature exists to make visible.
+//
+// ```novo
+// use std.list
+// use qbbuild
+// use qbrender
+//
+// fn main() [io]
+//     let e = qbbuild.eq("id", qbbuild.int_value(7))
+//     match qbrender.render_expr([], e, qbrender.options(QbPostgres), 0)
+//         Ok(r)  => println("${list.len(r.text)}")
+//         Err(_) => println("no")
+// ```
+pub fn render_expr(out: [u8], e: qbast.QbExpr, o: QbRenderOptions,
+                   first_param: Int) -> Result<QbRender, qberror.QbFault> []
+    todo("query-builder-nv.qbrender.render_expr")
+
+// Every fault in `s` for `o`'s dialect, in the order the render would
+// have met them.
+//
+// An empty list means `render` will succeed.  What a test asserts and
+// what a tool porting a program to another dialect reads.
+//
+// ```novo
+// use std.list
+// use qbast
+// use qbbuild
+// use qbrender
+//
+// fn main() [io]
+//     let s = qbbuild.select()
+//     println("${list.len(qbrender.check(QbStmtSelect(s), qbrender.options(QbSqlite)))}")
+// ```
+pub fn check(s: qbast.QbStmt, o: QbRenderOptions) -> [qberror.QbFault] []
+    todo("query-builder-nv.qbrender.check")
+
+// The features `s` uses that `d` does not have, one fault each.
+//
+// The port question on its own: a caller moving from SQLite to
+// PostgreSQL calls this for every statement in their program and gets
+// the list of things to rewrite, without the malformed-statement
+// faults mixed in.
+//
+// ```novo
+// use std.list
+// use qbast
+// use qbbuild
+// use qbrender
+//
+// fn main() [io]
+//     let s = qbbuild.select()
+//     println("${list.len(qbrender.unsupported(QbStmtSelect(s), QbMysql))}")
+// ```
+pub fn unsupported(s: qbast.QbStmt, d: qbdialect.QbDialect) -> [qberror.QbFault] []
+    todo("query-builder-nv.qbrender.unsupported")
+
+// True when `s` is an `UPDATE` or `DELETE` with no `WHERE` — a
+// statement that touches every row.
+//
+// Not refused by default, because "set every row's flag" is a real
+// statement; published as a question so a review, a test or a
+// production guard can ask it.
+//
+// ```novo
+// use qbast
+// use qbbuild
+// use qbrender
+//
+// fn main() [io]
+//     println("${qbrender.unguarded(QbStmtDelete(qbbuild.delete("sessions")))}")
+// ```
+pub fn unguarded(s: qbast.QbStmt) -> Bool []
+    todo("query-builder-nv.qbrender.unguarded")
+
+// How many bytes `render` will append, without appending them.
+//
+// Exact, not an estimate: the same walk, counting instead of writing.
+//
+// ```novo
+// use qbast
+// use qbbuild
+// use qbrender
+//
+// fn main() [io]
+//     let s = qbbuild.from(qbbuild.select(), "users", "")
+//     match qbrender.render_len(QbStmtSelect(s), qbrender.options(QbSqlite))
+//         Ok(n)  => println("${n}")
+//         Err(_) => println("no")
+// ```
+pub fn render_len(s: qbast.QbStmt, o: QbRenderOptions) -> Result<Int, qberror.QbFault> []
+    todo("query-builder-nv.qbrender.render_len")
+
+// One identifier appended to `out`, quoted if it needs quoting in this
+// dialect.
+//
+// Published because it is the piece of this package a caller writing
+// their own SQL most often needs, and the piece they are most likely
+// to get wrong — the escape for a quote inside a quoted identifier is
+// to double it, not to backslash it, in all three dialects that can
+// quote at all.
+//
+// `QbUnquotableIdent` for a name that needs quoting in a dialect that
+// cannot quote, which is every reserved word in `QbSqlEngine`.
+//
+// ```novo
+// use std.list
+// use qbrender
+//
+// fn main() [io]
+//     match qbrender.write_ident([], "user", QbPostgres, false)
+//         Ok(b)  => println("${list.len(b)}")
+//         Err(_) => println("no")
+// ```
+pub fn write_ident(out: [u8], name: Str, d: qbdialect.QbDialect,
+                   always: Bool) -> Result<[u8], qberror.QbFault> []
+    todo("query-builder-nv.qbrender.write_ident")
+
+// One value appended to `out` as a LITERAL, escaped for this dialect.
+//
+// For `QbLit`, and for a caller writing their own SQL around a
+// constant they control.  NOT a substitute for binding: an escaped
+// literal is still a value in the query's text, which is what changes
+// the plan cache and what makes a log of the SQL a log of the data.
+//
+// ```novo
+// use std.list
+// use qbbuild
+// use qbrender
+//
+// fn main() [io]
+//     match qbrender.write_literal([], qbbuild.text_value("o'brien"), QbSqlite)
+//         Ok(b)  => println("${list.len(b)}")
+//         Err(_) => println("no")
+// ```
+pub fn write_literal(out: [u8], v: qbast.QbValue,
+                     d: qbdialect.QbDialect) -> Result<[u8], qberror.QbFault> []
+    todo("query-builder-nv.qbrender.write_literal")
+
+// How many `QbRaw` expressions `s` contains — `qbast.raw_count`, named
+// here too because this is the module a reviewer is reading when they
+// want to know.
+//
+// ```novo
+// use qbast
+// use qbbuild
+// use qbrender
+//
+// fn main() [io]
+//     println("${qbrender.raw_sites(QbStmtSelect(qbbuild.select()))}")
+// ```
+pub fn raw_sites(s: qbast.QbStmt) -> Int []
+    todo("query-builder-nv.qbrender.raw_sites")
+
+// The SQL this package cannot build, as one line each.
+//
+// Published as a function rather than left to the README so a caller
+// can print it from their own `--help`, and so the list is somewhere a
+// test can compare against when it grows.
+//
+// ```novo
+// use std.list
+// use qbrender
+//
+// fn main() [io]
+//     println("${list.len(qbrender.cannot_build())}")
+// ```
+pub fn cannot_build() -> [Str] []
+    todo("query-builder-nv.qbrender.cannot_build")

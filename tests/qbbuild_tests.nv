@@ -1,0 +1,324 @@
+// qbbuild_tests.nv — the builder chain, and the two places a caller
+// folding a list of filters gets an identity backwards.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented:
+// query-builder-nv.<module>.<fn>`.  That is the expected result until
+// the bodies land.
+//
+// THE INTERESTING ASSERTIONS ARE THE EMPTY AND THE REPEATED CASES.  A
+// builder is used in a loop over conditions that may all be absent,
+// and the two identities — `all_of([])` is true, `any_of([])` is
+// false — are opposite and are what a caller reaches first.
+
+use std.test
+use std.list
+use qbast
+use qbbuild
+
+@test
+fn test_an_empty_select_is_the_starting_value() [io]
+    let s = qbbuild.select()
+
+    test.case("no columns, no joins, no conditions")
+    test.assert(list.len(s.columns) == 0)
+    test.assert(list.len(s.joins) == 0)
+    test.assert(list.len(s.ctes) == 0)
+
+    test.case("and no limit or offset, spelled -1 rather than 0")
+    test.assert(s.limit == 0 - 1)
+    test.assert(s.offset == 0 - 1)
+
+    test.case("a select with no FROM is legal and is how a caller computes")
+    match s.from
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+@test
+fn test_each_call_answers_a_new_statement_rather_than_mutating() [io]
+    let base = qbbuild.from(qbbuild.select(), "users", "")
+    let a = qbbuild.limit(base, 10)
+    let b = qbbuild.limit(base, 20)
+
+    test.case("two queries from one base do not interfere")
+    test.assert(a.limit == 10)
+    test.assert(b.limit == 20)
+
+    test.case("and the base is untouched")
+    test.assert(base.limit == 0 - 1)
+
+@test
+fn test_and_where_accumulates_and_where_replaces() [io]
+    // The distinction that matters: a builder with only `where_` makes
+    // every caller write the match, and the caller who forgets
+    // replaces the tenant filter with the search filter — a data leak
+    // with no error message.
+    let s = qbbuild.from(qbbuild.select(), "users", "")
+    let tenant = qbbuild.eq("tenant", qbbuild.int_value(1))
+    let search = qbbuild.like("name", "ada%")
+
+    test.case("and_where keeps both, so both values are bound")
+    let both = qbbuild.and_where(qbbuild.and_where(s, tenant), search)
+    test.assert(list.len(qbast.binds_of(QbStmtSelect(both))) == 2)
+
+    test.case("where_ replaces, so only the last one is")
+    let one = qbbuild.where_(qbbuild.where_(s, tenant), search)
+    test.assert(list.len(qbast.binds_of(QbStmtSelect(one))) == 1)
+
+    test.case("or_where accumulates too")
+    let either = qbbuild.or_where(qbbuild.and_where(s, tenant), search)
+    test.assert(list.len(qbast.binds_of(QbStmtSelect(either))) == 2)
+
+@test
+fn test_the_two_empty_identities_are_opposite() [io]
+    // A caller folding a list of filters reaches the empty case first,
+    // and the right answer differs by which fold they are doing.
+    test.case("all of nothing is true — it filters nothing out")
+    match qbbuild.all_of([])
+        QbLit(QbBool(v)) => test.assert(v)
+        _                => test.assert(false)
+
+    test.case("any of nothing is false — nothing matches")
+    match qbbuild.any_of([])
+        QbLit(QbBool(v)) => test.assert(v == false)
+        _                => test.assert(false)
+
+    test.case("and a single-element fold is that element, not a wrapper")
+    let one = qbbuild.is_null("x")
+    test.assert(list.len(qbast.binds_of(QbStmtSelect(
+        qbbuild.and_where(qbbuild.select(), qbbuild.all_of([one]))))) == 0)
+
+@test
+fn test_the_comparisons_bind_by_construction() [io]
+    // There is no spelling of `eq` that puts the value in the text,
+    // which is the whole of the package's safety property.
+    let cases = [qbbuild.eq("a", qbbuild.int_value(1)),
+                 qbbuild.ne("a", qbbuild.int_value(1)),
+                 qbbuild.lt("a", qbbuild.int_value(1)),
+                 qbbuild.le("a", qbbuild.int_value(1)),
+                 qbbuild.gt("a", qbbuild.int_value(1)),
+                 qbbuild.ge("a", qbbuild.int_value(1))]
+
+    test.case("every one of the six binds exactly one value")
+    for c in cases
+        let s = qbbuild.and_where(qbbuild.select(), c)
+        test.assert(list.len(qbast.binds_of(QbStmtSelect(s))) == 1)
+
+    test.case("between binds two")
+    let b = qbbuild.between("age", qbbuild.int_value(18), qbbuild.int_value(30))
+    test.assert(list.len(qbast.binds_of(QbStmtSelect(
+        qbbuild.and_where(qbbuild.select(), b)))) == 2)
+
+    test.case("in_values binds one per value")
+    let i = qbbuild.in_values("id", [qbbuild.int_value(1), qbbuild.int_value(2),
+                                     qbbuild.int_value(3)])
+    test.assert(list.len(qbast.binds_of(QbStmtSelect(
+        qbbuild.and_where(qbbuild.select(), i)))) == 3)
+
+    test.case("and is_null binds none, because there is nothing to bind")
+    test.assert(list.len(qbast.binds_of(QbStmtSelect(
+        qbbuild.and_where(qbbuild.select(), qbbuild.is_null("x"))))) == 0)
+    test.assert(list.len(qbast.binds_of(QbStmtSelect(
+        qbbuild.and_where(qbbuild.select(), qbbuild.is_not_null("x"))))) == 0)
+
+@test
+fn test_a_like_pattern_is_bound_and_escaping_is_the_callers_decision() [io]
+    test.case("the pattern is bound, so wildcards in a search term stay live")
+    let s = qbbuild.and_where(qbbuild.select(), qbbuild.like("name", "100%"))
+    test.assert(list.len(qbast.binds_of(QbStmtSelect(s))) == 1)
+
+    test.case("and escape_like is the helper for when they should not be")
+    test.assert(qbbuild.escape_like("100%") == "100\\%")
+    test.assert(qbbuild.escape_like("a_b") == "a\\_b")
+    test.assert(qbbuild.escape_like("plain") == "plain")
+
+@test
+fn test_the_values_are_six_and_each_keeps_what_it_was_given() [io]
+    test.case("an integer")
+    match qbbuild.int_value(7)
+        QbInt(v) => test.assert(v == 7)
+        _        => test.assert(false)
+
+    test.case("text")
+    match qbbuild.text_value("ada")
+        QbText(v) => test.assert(v == "ada")
+        _         => test.assert(false)
+
+    test.case("a boolean, which is not an integer — the dialect decides how to write it")
+    match qbbuild.bool_value(true)
+        QbBool(v) => test.assert(v)
+        _         => test.assert(false)
+
+    test.case("a float")
+    match qbbuild.float_value(1.5)
+        QbFloat(_) => test.assert(true)
+        _          => test.assert(false)
+
+    test.case("and a blob")
+    match qbbuild.blob_value([])
+        QbBlob(v) => test.assert(list.len(v) == 0)
+        _         => test.assert(false)
+
+@test
+fn test_a_select_accumulates_its_clauses() [io]
+    var q = qbbuild.select()
+    q = qbbuild.columns(q, ["id", "name"])
+    q = qbbuild.column(q, "email")
+    q = qbbuild.column_as(q, qbbuild.is_null("deleted_at"), "alive")
+    q = qbbuild.from(q, "users", "u")
+    q = qbbuild.distinct(q)
+    q = qbbuild.group_by(q, "country")
+    q = qbbuild.and_having(q, qbbuild.gt("n", qbbuild.int_value(1)))
+    q = qbbuild.order_by(q, "created_at", true)
+    q = qbbuild.order_by_nulls(q, "name", false, QbNullsLast)
+
+    test.case("four selected items")
+    test.assert(list.len(q.columns) == 4)
+
+    test.case("one group-by term and two order-by terms")
+    test.assert(list.len(q.group_by) == 1)
+    test.assert(list.len(q.order_by) == 2)
+
+    test.case("distinct is set")
+    test.assert(q.distinct)
+
+    test.case("and the direction and null placement are kept")
+    match list.nth(q.order_by, 0)
+        Some(o) => test.assert(o.descending)
+        None    => test.assert(false)
+
+@test
+fn test_a_join_a_cte_and_a_union_each_go_on_the_select() [io]
+    let base = qbbuild.from(qbbuild.select(), "users", "u")
+
+    test.case("a join")
+    let joined = qbbuild.join(base, QbLeft, "orders", "o",
+                              qbbuild.is_not_null("o.user_id"))
+    test.assert(list.len(joined.joins) == 1)
+
+    test.case("a CTE")
+    let body = qbbuild.from(qbbuild.select(), "events", "")
+    test.assert(list.len(qbbuild.with_cte(base, "recent", body, false).ctes) == 1)
+
+    test.case("a recursive CTE carries the flag")
+    for c in qbbuild.with_cte(base, "tree", body, true).ctes
+        test.assert(c.recursive)
+
+    test.case("a set operation")
+    test.assert(list.len(qbbuild.union(base, QbUnionAll, body).set_arms) == 1)
+
+    test.case("and a subquery source")
+    let nested = qbbuild.from_select(qbbuild.select(), base, "inner")
+    match nested.from
+        Some(_) => test.assert(true)
+        None    => test.assert(false)
+
+@test
+fn test_paging_is_published_because_the_arithmetic_is_written_wrongly() [io]
+    test.case("page zero starts at offset zero")
+    test.assert(qbbuild.page(qbbuild.select(), 0, 25).offset == 0)
+    test.assert(qbbuild.page(qbbuild.select(), 0, 25).limit == 25)
+
+    test.case("page two of twenty-five starts at fifty, not seventy-five")
+    test.assert(qbbuild.page(qbbuild.select(), 2, 25).offset == 50)
+
+@test
+fn test_a_count_query_drops_what_a_count_must_not_carry() [io]
+    // The query that goes beside a paginated one, and the one a caller
+    // building by hand gets wrong by leaving the ORDER BY on.
+    var q = qbbuild.from(qbbuild.select(), "users", "")
+    q = qbbuild.columns(q, ["id", "name"])
+    q = qbbuild.and_where(q, qbbuild.eq("tenant", qbbuild.int_value(1)))
+    q = qbbuild.order_by(q, "created_at", true)
+    q = qbbuild.page(q, 3, 25)
+
+    let c = qbbuild.count_of(q)
+
+    test.case("the ordering, the limit and the offset are gone")
+    test.assert(list.len(c.order_by) == 0)
+    test.assert(c.limit == 0 - 1)
+    test.assert(c.offset == 0 - 1)
+
+    test.case("the condition survives, because it decides what is counted")
+    test.assert(list.len(qbast.binds_of(QbStmtSelect(c))) == 1)
+
+    test.case("and one column is selected — the count")
+    test.assert(list.len(c.columns) == 1)
+
+@test
+fn test_the_three_writers_each_start_empty() [io]
+    test.case("an insert names its table and its columns")
+    let i = qbbuild.insert("users", ["name", "email"])
+    test.assert(i.table == "users")
+    test.assert(list.len(i.columns) == 2)
+    test.assert(list.len(i.rows) == 0)
+
+    test.case("rows go on one at a time")
+    let two = qbbuild.values(qbbuild.values(i, [qbbuild.text_value("ada"),
+                                                qbbuild.text_value("a@x")]),
+                             [qbbuild.text_value("bo"), qbbuild.text_value("b@x")])
+    test.assert(list.len(two.rows) == 2)
+    test.assert(list.len(qbast.binds_of(QbStmtInsert(two))) == 4)
+
+    test.case("an update starts with nothing set")
+    let u = qbbuild.update("users")
+    test.assert(u.table == "users")
+    test.assert(list.len(u.set) == 0)
+
+    test.case("and a delete with no condition")
+    let d = qbbuild.delete("sessions")
+    test.assert(d.table == "sessions")
+    match d.where_
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+@test
+fn test_an_upsert_carries_its_target_and_its_assignments() [io]
+    let i = qbbuild.values(qbbuild.insert("users", ["email", "name"]),
+                           [qbbuild.text_value("a@x"), qbbuild.text_value("ada")])
+
+    test.case("do nothing names the target and sets nothing")
+    let ignore = qbbuild.on_conflict_ignore(i, ["email"])
+    test.assert(list.len(ignore.conflict_columns) == 1)
+    test.assert(list.len(ignore.conflict_set) == 0)
+
+    test.case("do update names both")
+    let upd = qbbuild.on_conflict_update(i, ["email"],
+                [qbbuild.assign("name", qbbuild.text_value("ada"))])
+    test.assert(list.len(upd.conflict_columns) == 1)
+    test.assert(list.len(upd.conflict_set) == 1)
+
+    test.case("and an expression assignment is what count = count + 1 needs")
+    let e = qbbuild.assign_expr("seen",
+              QbBinop(QbAdd, QbCol("seen"), QbLit(qbbuild.int_value(1))))
+    test.assert(e.column == "seen")
+
+@test
+fn test_the_writers_take_conditions_and_returning_items() [io]
+    test.case("an update's condition accumulates like a select's")
+    var u = qbbuild.update("users")
+    u = qbbuild.set(u, qbbuild.assign("name", qbbuild.text_value("ada")))
+    u = qbbuild.update_where(u, qbbuild.eq("id", qbbuild.int_value(1)))
+    u = qbbuild.update_where(u, qbbuild.is_null("deleted_at"))
+    test.assert(list.len(qbast.binds_of(QbStmtUpdate(u))) == 2)
+
+    test.case("returning items go on each of the three writers")
+    test.assert(list.len(qbbuild.update_returning(u, ["id"]).returning) == 1)
+    let d = qbbuild.delete_where(qbbuild.delete("sessions"),
+                                 qbbuild.eq("id", qbbuild.int_value(1)))
+    test.assert(list.len(qbbuild.delete_returning(d, ["id"]).returning) == 1)
+    let i = qbbuild.insert("users", ["name"])
+    test.assert(list.len(qbbuild.insert_returning(i, ["id"]).returning) == 1)
+
+@test
+fn test_an_insert_from_a_select_replaces_its_rows() [io]
+    let i = qbbuild.insert("archive", ["id"])
+    let s = qbbuild.from(qbbuild.select(), "users", "")
+
+    test.case("the select is carried")
+    match qbbuild.insert_select(i, s).from_select
+        Some(_) => test.assert(true)
+        None    => test.assert(false)
+
+    test.case("and the table is still the insert's")
+    test.assert(qbbuild.insert_select(i, s).table == "archive")
