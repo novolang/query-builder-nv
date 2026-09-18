@@ -229,7 +229,7 @@ pub enum QbSource
     // two and `qbrender.unsupported` names it.
     QbSubquery(inner: QbSelect, as_name: Str)
     // A CTE by name, with an optional alias.
-    QbCteRef(name: String, as_name: Str)
+    QbCteRef(name: Str, as_name: Str)
 
 // One join in a `SELECT`.
 pub struct QbJoin

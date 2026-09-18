@@ -91,6 +91,19 @@ pub struct QbFault
     // for a fault about the statement as a whole.
     at: Str
 
+// `QbFault` is an `Error`, which is what lets `Result<T, QbFault>`
+// exist at all — every fallible signature in `qbrender` answers with
+// one, from `render` and `render_str` through `render_len` to
+// `write_ident` and `write_literal`.
+impl Error for QbFault
+    // The one-line message: `qberror.message`'s sentence, the kind
+    // named with the path into the statement it is about and, where
+    // the fault has one, the dialect.
+    //
+    // Panics with `not implemented` until the bodies land.
+    fn message(self) -> Str
+        todo("query-builder-nv.QbFault.message")
+
 // A fault, built.
 //
 // ```novo
