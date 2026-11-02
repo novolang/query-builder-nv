@@ -1,11 +1,6 @@
 // qbbuild_tests.nv — the builder chain, and the two places a caller
 // folding a list of filters gets an identity backwards.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented:
-// query-builder-nv.<module>.<fn>`.  That is the expected result until
-// the bodies land.
-//
 // THE INTERESTING ASSERTIONS ARE THE EMPTY AND THE REPEATED CASES.  A
 // builder is used in a loop over conditions that may all be absent,
 // and the two identities — `all_of([])` is true, `any_of([])` is
@@ -80,7 +75,7 @@ fn test_the_two_empty_identities_are_opposite() [io]
 
     test.case("any of nothing is false — nothing matches")
     match qbbuild.any_of([])
-        QbLit(QbBool(v)) => test.assert(v == false)
+        QbLit(QbBool(v)) => test.assert(not v)
         _                => test.assert(false)
 
     test.case("and a single-element fold is that element, not a wrapper")

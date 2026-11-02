@@ -1,11 +1,6 @@
 // qbrender_tests.nv — the bytes, the parameters beside them, and the
 // three refusals.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented:
-// query-builder-nv.<module>.<fn>`.  That is the expected result until
-// the bodies land.
-//
 // THE ASSERTIONS ARE WHOLE STATEMENTS, on purpose.  A renderer's bugs
 // are a missing space, a comma in the wrong place and a clause emitted
 // in the wrong order, and none of those is visible in an assertion
@@ -114,7 +109,7 @@ fn test_an_empty_in_list_is_refused_rather_than_guessed_at() [io]
                 _             => test.assert(false)
 
             test.case("and it is a mistake in the statement, not a dialect limit")
-            test.assert(qberror.is_dialect_limit(f) == false)
+            test.assert(not qberror.is_dialect_limit(f))
 
     test.case("a list with something in it renders one placeholder per value")
     let two = qbbuild.and_where(qbbuild.from(qbbuild.select(), "users", ""),
@@ -177,7 +172,7 @@ fn test_an_unguarded_write_is_reported_and_optionally_refused() [io]
 
     test.case("a DELETE that HAS a WHERE is not unguarded")
     let guarded = qbbuild.delete_where(d, qbbuild.eq("id", qbbuild.int_value(1)))
-    test.assert(qbrender.unguarded(QbStmtDelete(guarded)) == false)
+    test.assert(not qbrender.unguarded(QbStmtDelete(guarded)))
 
 @test
 fn test_raw_sql_is_countable_and_forbiddable() [io]
@@ -215,7 +210,7 @@ fn test_a_literal_is_escaped_and_is_still_not_a_parameter() [io]
 
     test.case("MySQL also escapes the backslash, which the other three do not")
     test.assert(qbdialect.backslash_escapes(QbMysql))
-    test.assert(qbdialect.backslash_escapes(QbPostgres) == false)
+    test.assert(not qbdialect.backslash_escapes(QbPostgres))
 
     test.case("and a boolean is TRUE in PostgreSQL and 1 elsewhere")
     test.assert(qbdialect.boolean_literal(QbPostgres, true) == "TRUE")
@@ -389,7 +384,7 @@ fn test_a_statement_answers_what_it_touches_without_a_match() [io]
 
     test.case("a select names no target table, because it writes nothing")
     test.assert(qbast.target_table(QbStmtSelect(s)) == "")
-    test.assert(qbast.is_write(QbStmtSelect(s)) == false)
+    test.assert(not qbast.is_write(QbStmtSelect(s)))
 
     test.case("each of the three writers names its own")
     test.assert(qbast.target_table(QbStmtDelete(d)) == "sessions")

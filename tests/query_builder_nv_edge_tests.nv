@@ -1,0 +1,2025 @@
+// query_builder_nv_edge_tests.nv — the boundary between a query and its
+// parameters, and the corners the release's own suites leave dark.
+//
+// ADDED WITH THE 0.1.0 BODIES, on top of the three suites the interface
+// release shipped.  Those three assert what a correct render looks
+// like; this one asserts what a hostile input CANNOT make it look like,
+// and covers the clauses, dialects and fault kinds they leave without
+// an assertion.
+//
+// THE HEADLINE CLAIM IS THE FIRST TWO CASES.  A query builder exists to
+// keep a value out of the statement's shape: a quote must not end a
+// string, a newline must not end a line, a backslash must not start an
+// escape, a NUL must not truncate anything, and `?` must not become a
+// placeholder.  Every one of those is tested the way the claim is made
+// — by rendering the SAME statement with a hostile value and with a
+// harmless one and asserting the two statements are byte-identical,
+// with the value found whole in the parameter list.  None of these
+// assertions reads the emitted text for the value's sake, so all of
+// them fail if the renderer ever interpolates.
+//
+// The rest is arithmetic on the parts a mutation walks past: the order
+// of the clauses, the order and numbering of the placeholders, the zero
+// byte that ends a buffer, and which of the dialect limits are written
+// anyway rather than refused.
+
+use std.test
+use std.list
+use std.bytes
+use std.str
+use qbast
+use qbbuild
+use qbdialect
+use qberror
+use qbrender
+
+// ── The values nobody lets near a statement ──────────────────────────
+
+// A single quote.
+fn quote() -> Str
+    str.from_byte(39)
+
+// A newline.
+fn nl() -> Str
+    str.from_byte(10)
+
+// A carriage return.
+fn cr() -> Str
+    str.from_byte(13)
+
+// A tab.
+fn tab() -> Str
+    str.from_byte(9)
+
+// A backslash, which MySQL reads as an escape and the other three do
+// not.
+fn backslash() -> Str
+    str.from_byte(92)
+
+// A zero byte, which terminates a string in anything below this
+// package.
+fn nul() -> Str
+    str.from_byte(0)
+
+// A search term that would end the statement it was pasted into, and
+// then run a second one.
+fn injection() -> Str
+    quote() + "; DROP TABLE users; --"
+
+// An identifier that is a keyword in every dialect here.
+fn keyword() -> Str
+    "select"
+
+// The hostile inputs, and one harmless one to compare against.
+//
+// Every string here is a value: text a person typed into a search box,
+// a name read out of a request body, a filename off a disk.  The list
+// is the boundary's whole vocabulary — the byte that ends a string, the
+// byte that starts an escape, the byte that ends a line, the bytes that
+// look like the renderer's own syntax, and the words that mean
+// something to the parser.
+fn hostile_values() -> [Str]
+    ["ada",
+     "o'brien",
+     injection(),
+     quote() + " OR " + quote() + "1" + quote() + "=" + quote() + "1",
+     quote() + quote() + quote(),
+     "a" + nl() + "b",
+     nl() + "DROP TABLE users",
+     "a" + cr() + "b",
+     "a" + tab() + "b",
+     "a" + backslash() + "b",
+     "a" + backslash() + quote() + "b",
+     "a" + nul() + "b",
+     nul(),
+     nul() + "WHERE 1=1",
+     "NULL",
+     "null",
+     "1; SELECT pg_sleep(10)",
+     "?",
+     "?1",
+     "? 1",
+     "$1",
+     "@p1",
+     ":name",
+     "%%s",
+     "%",
+     "_",
+     "name = ?",
+     "name = " + quote() + "x" + quote(),
+     "-1 OR 1=1",
+     "--",
+     "/*",
+     "*/",
+     "\\?",
+     "a" + nl() + "FROM pg_catalog.pg_user --"]
+
+// The same statement with `v` as the value of the `name` column, so
+// that two calls differ only in a value and not at all in a shape.
+fn by_name(v: Str) -> qbast.QbStmt
+    let s = qbbuild.where_(qbbuild.from(qbbuild.select(), "users", ""),
+                           qbbuild.eq("name", qbbuild.text_value(v)))
+    QbStmtSelect(s)
+
+// The statement every ordering case is about.
+//
+// A bind in the `JOIN`'s condition, two in the `WHERE`, one in the
+// `HAVING`, and one inside a union arm — so a numbering that is off by
+// one anywhere, or a walk that visits the clauses in a different order
+// from the way they are written, changes the string.
+fn wide_statement() -> qbast.QbStmt
+    let base = qbbuild.columns(qbbuild.from(qbbuild.select(), "users", "u"), ["id", "name"])
+    let on = QbCmp(QbEq, QbQual("o", "user_id"), QbBind(QbInt(7)))
+    let joined = qbbuild.join(base, QbInner, "orders", "o", on)
+    let filtered = qbbuild.and_where(
+                     qbbuild.and_where(joined, qbbuild.eq("tenant", qbbuild.text_value("acme"))),
+                     qbbuild.lt("age", qbbuild.int_value(40)))
+    let counted = QbCmp(QbGt, QbAgg("COUNT", [QbStar], false, None), QbBind(QbInt(1)))
+    let grouped = qbbuild.and_having(qbbuild.group_by(filtered, "country"), counted)
+    let arm = qbbuild.where_(qbbuild.from(qbbuild.select(), "archive", ""),
+                             qbbuild.eq("tenant", qbbuild.text_value("old")))
+    let united = qbbuild.union(grouped, QbUnionAll, arm)
+    QbStmtSelect(qbbuild.order_by(united, "name", false))
+
+// A join of a kind other than `QbCross` with no condition, which no
+// builder in `qbbuild` can build: the render is the only guard.
+fn join_without_on() -> qbast.QbStmt
+    QbStmtSelect(
+        QbSelect { ctes: [], distinct: false, distinct_on: [], columns: [],
+                   from: Some(QbTable("users", "u")),
+                   joins: [QbJoin { kind: QbInner, source: QbTable("orders", "o"), on: None }],
+                   where_: None, group_by: [], having: None, order_by: [],
+                   limit: -1, offset: -1, set_arms: [], for_update: false })
+
+// A select with the two fields no builder in `qbbuild` can reach.
+fn locked(on: [qbast.QbExpr], for_update: Bool) -> qbast.QbStmt
+    QbStmtSelect(
+        QbSelect { ctes: [], distinct: false, distinct_on: on, columns: [],
+                   from: Some(QbTable("users", "")), joins: [], where_: None,
+                   group_by: [], having: None, order_by: [], limit: -1,
+                   offset: -1, set_arms: [], for_update: for_update })
+
+// A subquery nested `n` deep in `FROM`.
+fn nested_select(n: Int) -> qbast.QbSelect
+    var s = qbbuild.from(qbbuild.select(), "users", "")
+    var i = 0
+    while i < n
+        s = qbbuild.from_select(qbbuild.select(), s, "")
+        i = i + 1
+    s
+
+// ── Small readers, so the assertions stay on one line each ───────────
+
+// The statement's text, or the marker that it was refused.
+fn sql_of(s: qbast.QbStmt, d: qbdialect.QbDialect) -> Str
+    match qbrender.render_str(s, qbrender.options(d))
+        Ok(r)  => r.sql
+        Err(_) => "<refused>"
+
+// The statement's text under a given set of options.
+fn sql_with(s: qbast.QbStmt, o: qbrender.QbRenderOptions) -> Str
+    match qbrender.render_str(s, o)
+        Ok(r)  => r.sql
+        Err(_) => "<refused>"
+
+// The statement's parameters, or nothing when it was refused.
+fn params_of(s: qbast.QbStmt, d: qbdialect.QbDialect) -> [qbast.QbValue]
+    match qbrender.render_str(s, qbrender.options(d))
+        Ok(r)  => r.params[:]
+        Err(_) => []
+
+// The message of the fault the render refused with, or the marker that
+// it rendered.
+fn render_error(s: qbast.QbStmt, d: qbdialect.QbDialect) -> Str
+    match qbrender.render_str(s, qbrender.options(d))
+        Ok(_)  => "<rendered>"
+        Err(f) => qberror.message(f)
+
+// The same, under a given set of options.
+fn options_error(s: qbast.QbStmt, o: qbrender.QbRenderOptions) -> Str
+    match qbrender.render_str(s, o)
+        Ok(_)  => "<rendered>"
+        Err(f) => qberror.message(f)
+
+// The kind name of the fault a render refused with, or the marker that
+// it rendered.
+fn refusal_kind(s: qbast.QbStmt, o: qbrender.QbRenderOptions) -> Str
+    match qbrender.render_str(s, o)
+        Ok(_)  => "<rendered>"
+        Err(f) => qberror.kind_name(f.kind)
+
+// One expression, without the byte that ends a buffer.
+fn expr_of(e: qbast.QbExpr, d: qbdialect.QbDialect) -> Str
+    match qbrender.render_expr([], e, qbrender.options(d), 0)
+        Ok(r)  => bytes.byte_list_to_str(list.slice(r.text, 0, list.len(r.text) - 1))
+        Err(_) => "<refused>"
+
+// The faults `check` reports, in walk order.
+fn faults_of(s: qbast.QbStmt, d: qbdialect.QbDialect) -> [qberror.QbFault]
+    qbrender.check(s, qbrender.options(d))
+
+// The message of the first fault, for the statement that has one.
+//
+// THE ELEMENT IS BOUND TO A NAME BEFORE ITS FIELDS ARE READ, and that
+// is a workaround rather than style.  On this toolchain a `Str` field
+// read straight off an element of a temporary list — the spelling
+// `list.get(faults_of(s, d), 0).at` — is a borrow of a cell the
+// temporary's release has already freed, and it answers the empty
+// string where the bound element answers the path; the interpreter
+// answers it correctly, so the two spellings do not describe the same
+// program.  Filed as `novo bugs`, area `memory-perceus`, slug
+// `a-str-field-read-off-a-temporary-lists-element-answers-a-freed-borrow`;
+// the three readers below bind for that reason, and the comment is the
+// sighting.  No package code depends on it: `qbrender.check` answers
+// the list, and the list keeps its strings alive.
+fn first_message(s: qbast.QbStmt, d: qbdialect.QbDialect) -> Str
+    let f = list.get(faults_of(s, d), 0)
+    qberror.message(f)
+
+// The path of the first fault.
+fn first_at(s: qbast.QbStmt, d: qbdialect.QbDialect) -> Str
+    let f = list.get(faults_of(s, d), 0)
+    f.at
+
+// The kind's short name, for the first fault.
+fn first_kind(s: qbast.QbStmt, d: qbdialect.QbDialect) -> Str
+    let f = list.get(faults_of(s, d), 0)
+    qberror.kind_name(f.kind)
+
+// The text a value holds, or a marker for the other five variants.
+fn text_of(v: qbast.QbValue) -> Str
+    match v
+        QbText(s) => s
+        _         => "<not text>"
+
+// Whether the render refuses the statement.
+fn refused(s: qbast.QbStmt, d: qbdialect.QbDialect) -> Bool
+    sql_of(s, d) == "<refused>"
+
+// One identifier, as this package writes it into a statement.
+fn ident_of(name: Str, d: qbdialect.QbDialect, always: Bool) -> Str
+    match qbrender.write_ident([], name, d, always)
+        Ok(bs) => bytes.byte_list_to_str(bs)
+        Err(_) => "<refused>"
+
+// One literal, as this package writes it into a statement.
+fn literal_of(v: qbast.QbValue, d: qbdialect.QbDialect) -> Str
+    match qbrender.write_literal([], v, d)
+        Ok(bs) => bytes.byte_list_to_str(list.slice(bs, 0, list.len(bs) - 1))
+        Err(_) => "<refused>"
+
+// The bytes a writer answered, or nothing when it refused.
+fn answer_of(r: Result<[u8], qberror.QbFault>) -> [u8]
+    match r
+        Ok(bs) => bs[:]
+        Err(_) => []
+
+// How many bytes a render would answer, or zero when it refused.
+fn render_len_of(s: qbast.QbStmt, o: qbrender.QbRenderOptions) -> Int
+    match qbrender.render_len(s, o)
+        Ok(n)  => n
+        Err(_) => 0
+
+// Render options with every switch spelled out.
+fn opts(d: qbdialect.QbDialect, pretty: Bool, quote_all: Bool, require_where: Bool,
+        forbid_raw: Bool, max_depth: Int, max_params: Int) -> qbrender.QbRenderOptions
+    QbRenderOptions { dialect: d, pretty: pretty, quote_all: quote_all,
+                      require_where: require_where, forbid_raw: forbid_raw,
+                      max_depth: max_depth, max_params: max_params }
+
+// ── The boundary ─────────────────────────────────────────────────────
+
+@test
+fn test_a_hostile_value_cannot_change_the_statement() [io]
+    let benign = "SELECT * FROM users WHERE name = ?"
+    let values = hostile_values()
+
+    test.case("every hostile value renders the same bytes as a harmless one")
+    for v in values
+        test.assert_eq_str(sql_of(by_name(v), QbSqlite), benign)
+
+    test.case("and not one of them adds a clause, a keyword or a comment")
+    for v in values
+        test.assert_eq(str.len(sql_of(by_name(v), QbSqlite)), str.len(benign))
+
+    test.case("nothing is interpolated, so the count of binds is always one")
+    for v in values
+        test.assert_eq(list.len(params_of(by_name(v), QbSqlite)), 1)
+
+    test.case("the value arrives in the parameter list, byte for byte")
+    for v in values
+        let ps = params_of(by_name(v), QbSqlite)
+        test.assert_eq_str(text_of(list.get(ps, 0)), v)
+
+    test.case("the parameter list is the tree's own order, not the text's")
+    for v in values
+        test.assert(params_of(by_name(v), QbSqlite) == qbast.binds_of(by_name(v)))
+
+    test.case("a newline, a tab, a carriage return and a backslash are all inside the value")
+    for v in [nl(), cr(), tab(), backslash(), nul()]
+        let ps = params_of(by_name(v), QbSqlite)
+        test.assert_eq_str(text_of(list.get(ps, 0)), v)
+
+@test
+fn test_a_value_that_looks_like_a_placeholder_is_still_a_value() [io]
+    let benign = sql_of(by_name("ada"), QbSqlite)
+
+    test.case("no value can add a parameter, even one spelled like one")
+    for v in ["?", "?1", "? 1", "$1", "$2", "@p1", ":name", "%%s", "1 + ?", "\\?"]
+        test.assert_eq_str(sql_of(by_name(v), QbSqlite), benign)
+        test.assert_eq(list.len(params_of(by_name(v), QbSqlite)), 1)
+
+    test.case("a value holding a placeholder is not one in PostgreSQL either")
+    for v in ["$1", "?", "?1", "$9"]
+        test.assert_eq_str(sql_of(by_name(v), QbPostgres),
+                           "SELECT * FROM users WHERE name = $1")
+
+    test.case("and the one placeholder the statement has is numbered from one")
+    test.assert_eq_str(sql_of(by_name("?1"), QbPostgres),
+                       "SELECT * FROM users WHERE name = $1")
+
+@test
+fn test_a_string_that_says_null_is_not_the_null() [io]
+    let as_literal = qbbuild.where_(qbbuild.from(qbbuild.select(), "users", ""),
+                                    QbCmp(QbEq, QbCol("name"), QbLit(QbText("NULL"))))
+    let as_value = by_name("NULL")
+    let the_null = qbbuild.where_(qbbuild.from(qbbuild.select(), "users", ""),
+                                  QbCmp(QbEq, QbCol("name"), QbLit(QbNull)))
+
+    test.case("a quoted NULL is text")
+    test.assert_eq_str(sql_of(QbStmtSelect(as_literal), QbSqlite),
+                       "SELECT * FROM users WHERE name = 'NULL'")
+
+    test.case("an unquoted NULL is the null")
+    test.assert_eq_str(sql_of(QbStmtSelect(the_null), QbSqlite),
+                       "SELECT * FROM users WHERE name = NULL")
+
+    test.case("a bound NULL is neither until the driver says so")
+    test.assert_eq_str(sql_of(as_value, QbSqlite), "SELECT * FROM users WHERE name = ?")
+    test.assert_eq(text_of(list.get(params_of(as_value, QbSqlite), 0)), "NULL")
+
+    test.case("the three are three different statements")
+    test.assert(sql_of(QbStmtSelect(as_literal), QbSqlite) != sql_of(QbStmtSelect(the_null), QbSqlite))
+    test.assert(sql_of(QbStmtSelect(as_literal), QbSqlite) != sql_of(as_value, QbSqlite))
+    test.assert(sql_of(QbStmtSelect(the_null), QbSqlite) != sql_of(as_value, QbSqlite))
+
+@test
+fn test_a_literal_is_escaped_and_a_bind_is_not() [io]
+    test.case("a quote in an inlined string is doubled, in every dialect that writes one")
+    // `injection()` opens with the quote that ends it, so the escaped
+    // form carries three in a row: the one that opens the literal and
+    // the two the value's own opening quote becomes.  Written as the
+    // doubling of that first byte rather than as a count of quotes, so
+    // the assertion says which byte moved.
+    let doubled = quote() + injection()
+    for d in qbdialect.dialects()
+        test.assert_eq_str(literal_of(QbText(injection()), d),
+                           quote() + doubled + quote())
+    test.assert_eq_str(literal_of(QbText(injection()), QbSqlite),
+                       quote() + quote() + quote() + "; DROP TABLE users; --" + quote())
+
+    test.case("a backslash in an inlined string is doubled only where it escapes")
+    test.assert_eq_str(literal_of(QbText("a" + backslash() + "b"), QbMysql),
+                       quote() + "a" + backslash() + backslash() + "b" + quote())
+    test.assert_eq_str(literal_of(QbText("a" + backslash() + "b"), QbSqlite),
+                       quote() + "a" + backslash() + "b" + quote())
+    test.assert_eq_str(literal_of(QbText("a" + backslash() + "b"), QbPostgres),
+                       quote() + "a" + backslash() + "b" + quote())
+
+    test.case("a quote written next to a backslash is two bytes, not one escape")
+    test.assert_eq_str(literal_of(QbText("a" + backslash() + quote() + "b"), QbSqlite),
+                       quote() + "a" + backslash() + quote() + quote() + "b" + quote())
+
+    test.case("the same value bound is not escaped at all, because it is not text yet")
+    let bound = by_name(injection())
+    test.assert_eq_str(sql_of(bound, QbMysql), "SELECT * FROM users WHERE name = ?")
+    test.assert_eq_str(text_of(list.get(params_of(bound, QbMysql), 0)), injection())
+    test.assert(not str.contains(sql_of(bound, QbMysql), "DROP"))
+
+    test.case("and a zero byte in a literal is a byte like any other")
+    test.assert_eq_str(literal_of(QbText("a" + nul() + "b"), QbSqlite),
+                       quote() + "a" + nul() + "b" + quote())
+
+@test
+fn test_an_identifier_is_quoted_or_refused_and_never_written_bare() [io]
+    test.case("a keyword is quoted in the three dialects that can quote")
+    test.assert_eq_str(ident_of(keyword(), QbSqlite, false), "\"" + keyword() + "\"")
+    test.assert_eq_str(ident_of(keyword(), QbPostgres, false), "\"" + keyword() + "\"")
+    test.assert_eq_str(ident_of(keyword(), QbMysql, false), "`" + keyword() + "`")
+
+    test.case("and refused by the one that cannot, rather than written bare")
+    test.assert_eq_str(ident_of(keyword(), QbSqlEngine, false), "<refused>")
+    test.assert_eq_str(ident_of(keyword(), QbSqlEngine, true), "<refused>")
+    test.assert_eq_str(ident_of("user", QbSqlEngine, false), "<refused>")
+
+    test.case("a name that needs no quoting is written bare")
+    test.assert_eq_str(ident_of("user", QbSqlite, false), "user")
+    test.assert_eq_str(ident_of("id", QbSqlEngine, false), "id")
+
+    test.case("a name reserved in another dialect is quoted here")
+    test.assert_eq_str(ident_of("user", QbPostgres, false), "\"user\"")
+    test.assert_eq_str(ident_of("id", QbPostgres, false), "id")
+
+    test.case("quote_all quotes a name that needed nothing")
+    test.assert_eq_str(ident_of("user", QbSqlite, true), "\"user\"")
+    test.assert_eq_str(ident_of("id", QbPostgres, true), "\"id\"")
+
+    test.case("a statement refuses a keyword identifier in the same place")
+    let q = qbbuild.column(qbbuild.select(), keyword())
+    test.assert_eq_str(sql_of(QbStmtSelect(q), QbSqlite), "SELECT \"select\"")
+    test.assert_eq_str(sql_of(QbStmtSelect(q), QbMysql), "SELECT `select`")
+    test.assert_eq_str(sql_of(QbStmtSelect(q), QbSqlEngine), "<refused>")
+    test.assert_eq(first_kind(QbStmtSelect(q), QbSqlEngine), "unquotable-ident")
+
+@test
+fn test_an_unwritable_identifier_is_refused_in_every_dialect() [io]
+    test.case("an empty name is not an identifier anywhere")
+    for d in qbdialect.dialects()
+        test.assert_eq_str(ident_of("", d, false), "<refused>")
+
+    test.case("a name holding the dialect's own quote character is refused")
+    test.assert_eq_str(ident_of("a\"b", QbPostgres, false), "<refused>")
+    test.assert_eq_str(ident_of("a\"b", QbSqlite, false), "<refused>")
+    test.assert_eq_str(ident_of("a`b", QbMysql, false), "<refused>")
+
+    test.case("the other dialect's quote character is an ordinary byte")
+    test.assert_eq_str(ident_of("a`b", QbPostgres, false), "\"a`b\"")
+    test.assert_eq_str(ident_of("a\"b", QbMysql, false), "`a\"b`")
+
+    test.case("a zero byte in a name is refused even where nothing else is")
+    let bad = "a" + nul() + "b"
+    for d in qbdialect.dialects()
+        test.assert_eq_str(ident_of(bad, d, false), "<refused>")
+
+    test.case("an unwritable name is a mistake in the statement, not a dialect limit")
+    let st = QbStmtSelect(qbbuild.column(qbbuild.select(), ""))
+    test.assert_eq(first_kind(st, QbSqlite), "unwritable-ident")
+    test.assert(not qberror.is_dialect_limit(list.get(faults_of(st, QbSqlite), 0)))
+
+    test.case("a column named after a keyword survives into the statement quoted")
+    let s = qbbuild.where_(qbbuild.from(qbbuild.select(), "t", ""),
+                           qbbuild.eq(keyword(), qbbuild.int_value(1)))
+    test.assert_eq_str(sql_of(QbStmtSelect(s), QbPostgres),
+                       "SELECT * FROM t WHERE \"select\" = $1")
+
+@test
+fn test_the_terminator_is_one_zero_byte_and_the_string_form_loses_it() [io]
+    let st = by_name("x")
+    let text = sql_of(st, QbSqlite)
+
+    test.case("render answers the statement and then one zero")
+    match qbrender.render([], st, qbrender.options(QbSqlite))
+        Ok(r)  =>
+            test.assert_eq(list.len(r.text), str.len(text) + 1)
+            test.assert_eq(list.get(r.text, list.len(r.text) - 1), 0)
+        Err(_) => test.assert(false)
+
+    test.case("the string form has the zero stripped and nothing else")
+    test.assert_eq(list.len(params_of(st, QbSqlite)), 1)
+    test.assert_eq(str.byte_at_or(text, str.len(text) - 1, 0), 63)
+
+    test.case("render_len counts the zero the string form strips")
+    test.assert_eq(render_len_of(st, qbrender.options(QbSqlite)), str.len(text) + 1)
+
+    test.case("the expression renderer ends the same way")
+    match qbrender.render_expr([], QbLit(QbInt(7)), qbrender.options(QbSqlite), 0)
+        Ok(r)  =>
+            test.assert_eq(list.len(r.text), 2)
+            test.assert_eq(list.get(r.text, 1), 0)
+        Err(_) => test.assert(false)
+
+    test.case("the two writers differ on purpose, and say so")
+    // `write_ident` answers the identifier and nothing else (4 bytes of
+    // `user`); `write_literal` answers the literal and the terminator
+    // (`'a'` is 3 bytes and the answer is 4; `7` is one and the answer
+    // is 2).  A caller splices the first mid-statement and turns the
+    // second into a `Str`, so only one of them may carry the zero.
+    test.assert_eq(list.len(answer_of(qbrender.write_ident([], "user", QbSqlite, false))), 4)
+    test.assert_eq(list.len(answer_of(qbrender.write_ident([], "user", QbSqlite, true))), 6)
+    test.assert_eq(list.len(answer_of(qbrender.write_literal([], QbText("a"), QbSqlite))), 4)
+    test.assert_eq(list.len(answer_of(qbrender.write_literal([], QbInt(7), QbSqlite))), 2)
+
+@test
+fn test_a_render_adds_to_the_buffer_without_writing_into_it() [io]
+    let st = by_name("x")
+    var head: [u8] = [65 as u8, 66 as u8]
+
+    test.case("the answer is the buffer and the statement and the zero")
+    match qbrender.render(head, st, qbrender.options(QbSqlite))
+        Ok(r)  =>
+            test.assert_eq(list.len(r.text), 2 + str.len(sql_of(st, QbSqlite)) + 1)
+            test.assert_eq(list.get(r.text, 0), 65)
+            test.assert_eq(list.get(r.text, 1), 66)
+            test.assert_eq(list.get(r.text, 2), 83)
+            test.assert_eq(list.get(r.text, list.len(r.text) - 1), 0)
+        Err(_) => test.assert(false)
+
+    test.case("and the buffer the caller still holds is as it was")
+    test.assert_eq(list.len(head), 2)
+    test.assert_eq(list.get(head, 0), 65)
+    test.assert_eq(list.get(head, 1), 66)
+
+@test
+fn test_a_refused_render_writes_nothing_into_the_buffer() [io]
+    var head: [u8] = [65 as u8]
+    let bad = join_without_on()
+
+    test.case("the fault is the answer, with the path into the statement")
+    match qbrender.render(head, bad, qbrender.options(QbSqlite))
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert_eq_str(qberror.message(f),
+                       "joins[0].on: a join other than a cross join needs an ON condition; QbCross is how a cross join is written")
+
+    test.case("and the caller's buffer is untouched")
+    test.assert_eq(list.len(head), 1)
+    test.assert_eq(list.get(head, 0), 65)
+
+    test.case("the same statement is refused by check, which names the join")
+    test.assert_eq(list.len(faults_of(bad, QbSqlite)), 1)
+    test.assert_eq_str(first_at(bad, QbSqlite), "joins[0].on")
+
+// ── Ordering and numbering ───────────────────────────────────────────
+
+@test
+fn test_the_clauses_are_written_in_the_order_sql_writes_them() [io]
+    test.case("postgres, with every clause the statement carries")
+    test.assert_eq_str(sql_of(wide_statement(), QbPostgres),
+        "SELECT id, name FROM users AS u INNER JOIN orders AS o ON o.user_id = $1" +
+        " WHERE tenant = $2 AND age < $3 GROUP BY country HAVING COUNT(*) > $4" +
+        " UNION ALL SELECT * FROM archive WHERE tenant = $5 ORDER BY name")
+
+    test.case("sqlite, the same statement with the other placeholder")
+    test.assert_eq_str(sql_of(wide_statement(), QbSqlite),
+        "SELECT id, name FROM users AS u INNER JOIN orders AS o ON o.user_id = ?" +
+        " WHERE tenant = ? AND age < ? GROUP BY country HAVING COUNT(*) > ?" +
+        " UNION ALL SELECT * FROM archive WHERE tenant = ? ORDER BY name")
+
+    test.case("mysql and sql-engine hold the same clause order")
+    test.assert_eq_str(sql_of(wide_statement(), QbMysql),
+        sql_of(wide_statement(), QbSqlite))
+    test.assert(refused(wide_statement(), QbSqlEngine))
+
+@test
+fn test_the_placeholders_are_numbered_in_the_order_the_text_carries_them() [io]
+    let st = wide_statement()
+
+    test.case("the parameter list is in the same order as the numbers")
+    test.assert(params_of(st, QbPostgres) == qbast.binds_of(st))
+
+    test.case("and the values are the ones the tree holds, in that order")
+    let ps = params_of(st, QbPostgres)
+    test.assert_eq(list.len(ps), 5)
+    test.assert_eq(list.get(ps, 0), QbInt(7))
+    test.assert_eq(text_of(list.get(ps, 1)), "acme")
+    test.assert_eq(list.get(ps, 2), QbInt(40))
+    test.assert_eq(list.get(ps, 3), QbInt(1))
+    test.assert_eq(text_of(list.get(ps, 4)), "old")
+
+    test.case("sqlite numbers nothing, so only the count can be pinned")
+    test.assert_eq(list.len(params_of(st, QbSqlite)), 5)
+
+    test.case("a subquery's bind is numbered where its text appears")
+    let inner = qbbuild.where_(qbbuild.from(qbbuild.select(), "orders", ""),
+                               qbbuild.eq("total", qbbuild.int_value(9)))
+    let outer = qbbuild.and_where(qbbuild.from_select(qbbuild.select(), inner, "o"),
+                                  qbbuild.eq("id", qbbuild.int_value(3)))
+    test.assert_eq_str(sql_of(QbStmtSelect(outer), QbPostgres),
+                       "SELECT * FROM (SELECT * FROM orders WHERE total = $1) AS o WHERE id = $2")
+    test.assert(params_of(QbStmtSelect(outer), QbPostgres) == qbast.binds_of(QbStmtSelect(outer)))
+
+    test.case("render_expr continues the caller's own numbering")
+    match qbrender.render_expr([], QbCmp(QbEq, QbCol("id"), QbBind(QbInt(1))),
+                               qbrender.options(QbPostgres), 6)
+        Ok(r)  =>
+            test.assert_eq_str(bytes.byte_list_to_str(list.slice(r.text, 0, list.len(r.text) - 1)),
+                               "id = $7")
+            test.assert_eq(list.len(r.params), 1)
+            test.assert_eq(list.get(r.params, 0), QbInt(1))
+        Err(_) => test.assert(false)
+
+    test.case("and starts at one when the caller has written none")
+    match qbrender.render_expr([], QbCmp(QbEq, QbCol("id"), QbBind(QbInt(1))),
+                               qbrender.options(QbPostgres), 0)
+        Ok(r)  =>
+            let text = bytes.byte_list_to_str(list.slice(r.text, 0, list.len(r.text) - 1))
+            test.assert_eq_str(text, "id = $1")
+        Err(_) => test.assert(false)
+
+@test
+fn test_the_walk_order_and_the_text_order_agree() [io]
+    test.case("a select: ctes, columns, from, joins, where, group, having, arms, order")
+    let st = wide_statement()
+    test.assert_eq(list.len(qbast.binds_of(st)), 5)
+    test.assert_eq(list.len(qbast.tables_of(st)), 3)
+    test.assert_eq(qbast.raw_count(st), 0)
+    test.assert(not qbast.is_write(st))
+    test.assert_eq_str(qbast.target_table(st), "")
+
+    test.case("an insert: rows, then the conflict assignment, then returning")
+    let ins = qbbuild.insert_returning(
+                qbbuild.on_conflict_update(
+                    qbbuild.values(qbbuild.insert("t", ["a", "b"]),
+                                   [qbbuild.int_value(1), qbbuild.text_value("x")]),
+                    [], [qbbuild.assign("b", qbbuild.text_value("y"))]),
+                ["a", "b"])
+    let ist = QbStmtInsert(ins)
+    test.assert(qbast.is_write(ist))
+    test.assert_eq_str(qbast.target_table(ist), "t")
+    test.assert_eq(list.len(qbast.binds_of(ist)), 3)
+    test.assert_eq_str(sql_of(ist, QbPostgres),
+        "INSERT INTO t (a, b) VALUES ($1, $2) ON CONFLICT DO UPDATE SET b = $3 RETURNING a, b")
+
+    test.case("an update: the assignments, then the where")
+    let up = QbStmtUpdate(
+               qbbuild.update_where(
+                 qbbuild.set(qbbuild.set(qbbuild.update("t"),
+                                         qbbuild.assign("a", qbbuild.int_value(1))),
+                             qbbuild.assign("b", qbbuild.text_value("x"))),
+                 qbbuild.eq("id", qbbuild.int_value(2))))
+    test.assert(qbast.is_write(up))
+    test.assert_eq_str(qbast.target_table(up), "t")
+    test.assert_eq(list.len(qbast.binds_of(up)), 3)
+    test.assert_eq_str(sql_of(up, QbPostgres),
+                       "UPDATE t SET a = $1, b = $2 WHERE id = $3")
+
+    test.case("a delete: the where")
+    let de = QbStmtDelete(qbbuild.delete_where(qbbuild.delete("t"),
+                                               qbbuild.le("id", qbbuild.int_value(2))))
+    test.assert(qbast.is_write(de))
+    test.assert_eq_str(qbast.target_table(de), "t")
+    test.assert_eq_str(sql_of(de, QbPostgres), "DELETE FROM t WHERE id <= $1")
+
+    test.case("spliced text is counted, wherever it sits")
+    let raw = QbStmtSelect(qbbuild.where_(qbbuild.from(qbbuild.select(), "t", ""),
+                                          QbAnd(QbRaw("a = b"), QbRaw("c = d"))))
+    test.assert_eq(qbast.raw_count(raw), 2)
+    test.assert_eq_str(sql_of(raw, QbSqlite), "SELECT * FROM t WHERE a = b AND c = d")
+
+    test.case("every expression shape carrying a bind is walked")
+    let carried = QbStmtSelect(qbbuild.where_(
+        qbbuild.from(qbbuild.select(), "t", ""),
+        QbAnd(QbAnd(QbIn(QbCol("a"), [QbBind(QbInt(1))], false),
+                    QbBetween(QbCol("b"), QbBind(QbInt(2)), QbBind(QbInt(3)), false)),
+              QbAnd(QbLike(QbCol("c"), QbBind(QbText("x")), "", false),
+                    QbILike(QbCol("d"), QbBind(QbText("y")), false)))))
+    test.assert_eq(list.len(qbast.binds_of(carried)), 5)
+    test.assert_eq(list.len(params_of(carried, QbPostgres)), 5)
+
+    test.case("a case, a call, a cast, a coalesce, an aggregate filter and a subquery")
+    let deep = QbStmtSelect(qbbuild.where_(
+        qbbuild.from(qbbuild.select(), "t", ""),
+        QbAnd(QbCase([QbCmp(QbEq, QbCol("a"), QbBind(QbInt(1)))], [QbBind(QbInt(2))], None),
+              QbAnd(QbFn("F", [QbBind(QbInt(3))]),
+                    QbAnd(QbCast(QbBind(QbInt(4)), "TEXT"),
+                          QbAnd(QbCoalesce([QbBind(QbInt(5))]),
+                                QbAnd(QbAgg("SUM", [QbBind(QbInt(6))], false, None),
+                                      QbNotEmpty(qbbuild.from(qbbuild.select(), "t", "")))))))))
+    test.assert_eq(list.len(qbast.binds_of(deep)), 6)
+    test.assert_eq(list.len(params_of(deep, QbPostgres)), 6)
+
+    test.case("and a scalar subquery and an exists are walked, binds and all")
+    let subs = QbStmtSelect(qbbuild.where_(
+        qbbuild.from(qbbuild.select(), "t", ""),
+        QbAnd(QbCmp(QbGt, QbScalar(qbbuild.where_(qbbuild.from(qbbuild.select(), "u", ""),
+                                                  QbCmp(QbEq, QbCol("x"), QbBind(QbInt(1))))),
+                    QbBind(QbInt(2))),
+              QbExists(qbbuild.where_(qbbuild.from(qbbuild.select(), "v", ""),
+                                      QbCmp(QbEq, QbCol("y"), QbBind(QbInt(3)))),
+                                      false))))
+    test.assert_eq(list.len(qbast.binds_of(subs)), 3)
+    test.assert_eq(list.len(params_of(subs, QbPostgres)), 3)
+
+// A condition that is true, spelled so a query can carry it.
+fn QbNotEmpty(inner: qbast.QbSelect) -> qbast.QbExpr
+    QbExists(inner, true)
+
+// ── The dialect limits: written, or refused ──────────────────────────
+
+@test
+fn test_sql_engine_cannot_bind_a_parameter_and_says_so() [io]
+    test.case("a statement with a bind is refused, and the reason is the bind")
+    test.assert(refused(by_name("x"), QbSqlEngine))
+    test.assert_eq(first_kind(by_name("x"), QbSqlEngine), "unsupported")
+    test.assert_eq_str(first_message(by_name("x"), QbSqlEngine),
+                       "where_.rhs: sql-engine has no parameters")
+
+    test.case("the same statement with the value inlined renders")
+    let inlined = qbbuild.where_(qbbuild.from(qbbuild.select(), "users", ""),
+                                 QbCmp(QbEq, QbCol("name"), QbLit(QbText("ada"))))
+    test.assert_eq_str(sql_of(QbStmtSelect(inlined), QbSqlEngine),
+                       "SELECT * FROM users WHERE name = 'ada'")
+
+    test.case("unsupported answers the dialect limits and only those")
+    test.assert_eq(list.len(qbrender.unsupported(by_name("x"), QbSqlEngine)), 1)
+    test.assert_eq(list.len(qbrender.unsupported(by_name("x"), QbSqlite)), 0)
+    test.assert_eq(list.len(qberror.dialect_limits(faults_of(by_name("x"), QbSqlEngine))), 1)
+    test.assert_eq(list.len(qberror.malformed(faults_of(by_name("x"), QbSqlEngine))), 0)
+
+@test
+fn test_the_limits_that_have_a_spelling_are_written_and_reported() [io]
+    test.case("a boolean literal is written the dialect's way")
+    let b = QbStmtSelect(qbbuild.where_(qbbuild.from(qbbuild.select(), "t", ""),
+                                        QbCmp(QbEq, QbCol("g"), QbLit(QbBool(true)))))
+    test.assert_eq_str(sql_of(b, QbSqlite), "SELECT * FROM t WHERE g = 1")
+    test.assert_eq_str(sql_of(b, QbMysql), "SELECT * FROM t WHERE g = 1")
+    test.assert_eq_str(sql_of(b, QbSqlEngine), "SELECT * FROM t WHERE g = 1")
+    test.assert_eq_str(sql_of(b, QbPostgres), "SELECT * FROM t WHERE g = TRUE")
+    test.assert_eq(first_kind(b, QbMysql), "unsupported")
+    test.assert_eq(list.len(faults_of(b, QbPostgres)), 0)
+    test.assert_eq_str(qbdialect.boolean_literal(QbPostgres, false), "FALSE")
+    test.assert_eq_str(qbdialect.boolean_literal(QbSqlEngine, false), "0")
+
+    test.case("a blob is hex, spelled two ways")
+    // The digits come from `bytes.to_hex`, which writes lower case; a
+    // SQL engine reads either.  The dialect decides the wrapper and
+    // nothing else.
+    let bl = QbStmtSelect(qbbuild.where_(
+                 qbbuild.from(qbbuild.select(), "t", ""),
+                 QbCmp(QbEq, QbCol("b"), QbLit(QbBlob([0 as u8, 255 as u8])))))
+    test.assert_eq_str(sql_of(bl, QbSqlite), "SELECT * FROM t WHERE b = X'00ff'")
+    test.assert_eq_str(sql_of(bl, QbPostgres), "SELECT * FROM t WHERE b = X'00ff'")
+    test.assert_eq_str(sql_of(bl, QbSqlEngine), "SELECT * FROM t WHERE b = X'00ff'")
+    test.assert_eq_str(sql_of(bl, QbMysql), "SELECT * FROM t WHERE b = 0x00ff")
+
+    test.case("mysql has no IS DISTINCT FROM, so it negates the spaceship")
+    let dis = QbStmtSelect(qbbuild.where_(qbbuild.from(qbbuild.select(), "t", ""),
+                                          QbCmp(QbDistinct, QbCol("a"), QbCol("b"))))
+    test.assert_eq_str(sql_of(dis, QbPostgres), "SELECT * FROM t WHERE a IS DISTINCT FROM b")
+    test.assert_eq_str(sql_of(dis, QbSqlite), "SELECT * FROM t WHERE a IS DISTINCT FROM b")
+    test.assert_eq_str(sql_of(dis, QbMysql), "SELECT * FROM t WHERE NOT (a <=> b)")
+    test.assert_eq(first_kind(dis, QbMysql), "unsupported")
+    test.assert_eq_str(first_message(dis, QbMysql),
+                       "where_: mysql has no is-distinct-from")
+    test.assert(not refused(dis, QbMysql))
+
+    test.case("mysql concatenates with a function, the rest with bars")
+    let cat = QbStmtSelect(qbbuild.column_as(qbbuild.select(),
+                                             QbBinop(QbConcat, QbCol("a"), QbCol("b")), ""))
+    test.assert_eq_str(sql_of(cat, QbSqlite), "SELECT a || b")
+    test.assert_eq_str(sql_of(cat, QbPostgres), "SELECT a || b")
+    test.assert_eq_str(sql_of(cat, QbMysql), "SELECT CONCAT(a, b)")
+
+    test.case("mysql has no conflict target and drops it rather than the upsert")
+    let ins = qbbuild.on_conflict_update(
+                qbbuild.values(qbbuild.insert("t", ["a"]), [qbbuild.int_value(1)]),
+                ["a"], [qbbuild.assign("a", qbbuild.int_value(2))])
+    test.assert_eq_str(sql_of(QbStmtInsert(ins), QbPostgres),
+                       "INSERT INTO t (a) VALUES ($1) ON CONFLICT (a) DO UPDATE SET a = $2")
+    test.assert_eq_str(sql_of(QbStmtInsert(ins), QbSqlite),
+                       "INSERT INTO t (a) VALUES (?) ON CONFLICT (a) DO UPDATE SET a = ?")
+    test.assert_eq_str(sql_of(QbStmtInsert(ins), QbMysql),
+                       "INSERT INTO t (a) VALUES (?) ON DUPLICATE KEY UPDATE a = ?")
+    test.assert_eq(first_kind(QbStmtInsert(ins), QbMysql), "unsupported")
+    test.assert_eq_str(first_at(QbStmtInsert(ins), QbMysql), "conflict_columns")
+    test.assert(not refused(QbStmtInsert(ins), QbMysql))
+
+    test.case("an ignore renders as DO NOTHING, and as INSERT IGNORE in mysql")
+    let ig = qbbuild.on_conflict_ignore(
+                qbbuild.values(qbbuild.insert("t", ["a"]), [qbbuild.int_value(1)]), [])
+    test.assert_eq_str(sql_of(QbStmtInsert(ig), QbPostgres),
+                       "INSERT INTO t (a) VALUES ($1) ON CONFLICT DO NOTHING")
+    test.assert_eq_str(sql_of(QbStmtInsert(ig), QbMysql),
+                       "INSERT IGNORE INTO t (a) VALUES (?)")
+
+    test.case("a bare offset needs a limit in front of it in sqlite")
+    let off = qbbuild.offset(qbbuild.from(qbbuild.select(), "t", ""), 20)
+    test.assert_eq_str(sql_of(QbStmtSelect(off), QbSqlite), "SELECT * FROM t LIMIT -1 OFFSET 20")
+    test.assert_eq_str(sql_of(QbStmtSelect(off), QbPostgres), "SELECT * FROM t OFFSET 20")
+    test.assert_eq_str(sql_of(QbStmtSelect(off), QbMysql), "SELECT * FROM t OFFSET 20")
+    test.assert_eq(first_kind(QbStmtSelect(off), QbSqlite), "unsupported")
+    test.assert_eq_str(first_at(QbStmtSelect(off), QbSqlite), "offset")
+
+    test.case("a limit of its own leaves the offset alone")
+    let both = qbbuild.offset(qbbuild.limit(qbbuild.from(qbbuild.select(), "t", ""), 10), 20)
+    test.assert_eq_str(sql_of(QbStmtSelect(both), QbSqlite), "SELECT * FROM t LIMIT 10 OFFSET 20")
+    test.assert_eq(list.len(faults_of(QbStmtSelect(both), QbSqlite)), 0)
+
+    test.case("a cross join drops a condition it cannot write")
+    let cross = QbStmtSelect(
+        QbSelect { ctes: [], distinct: false, distinct_on: [], columns: [],
+                   from: Some(QbTable("a", "")),
+                   joins: [QbJoin { kind: QbCross, source: QbTable("b", ""),
+                                    on: Some(QbCol("x")) }],
+                   where_: None, group_by: [], having: None, order_by: [],
+                   limit: -1, offset: -1, set_arms: [], for_update: false })
+    test.assert_eq_str(sql_of(cross, QbSqlite), "SELECT * FROM a CROSS JOIN b")
+    test.assert_eq_str(sql_of(cross, QbPostgres), "SELECT * FROM a CROSS JOIN b")
+    test.assert_eq(list.len(faults_of(cross, QbSqlite)), 0)
+
+@test
+fn test_the_limits_with_no_spelling_are_refused_and_named() [io]
+    let users = qbbuild.from(qbbuild.select(), "users", "u")
+
+    test.case("returning is refused by mysql alone")
+    let ins = qbbuild.insert_returning(
+                qbbuild.values(qbbuild.insert("t", ["a"]), [qbbuild.int_value(1)]), ["a"])
+    test.assert_eq_str(sql_of(QbStmtInsert(ins), QbPostgres),
+                       "INSERT INTO t (a) VALUES ($1) RETURNING a")
+    test.assert_eq_str(sql_of(QbStmtInsert(ins), QbSqlite),
+                       "INSERT INTO t (a) VALUES (?) RETURNING a")
+    test.assert(refused(QbStmtInsert(ins), QbMysql))
+    test.assert(refused(QbStmtInsert(ins), QbSqlEngine))
+    test.assert_eq(first_kind(QbStmtInsert(ins), QbMysql), "unsupported")
+    test.assert_eq_str(render_error(QbStmtInsert(ins), QbMysql), "mysql has no returning")
+
+    test.case("ilike is refused outside postgres")
+    let il = QbStmtSelect(qbbuild.where_(users, QbILike(QbCol("name"), QbBind(QbText("a%")), false)))
+    test.assert_eq_str(sql_of(il, QbPostgres), "SELECT * FROM users AS u WHERE name ILIKE $1")
+    test.assert(refused(il, QbSqlite))
+    test.assert(refused(il, QbMysql))
+    test.assert_eq(first_kind(il, QbMysql), "unsupported")
+    test.assert_eq_str(render_error(il, QbSqlite), "where_: sqlite has no ilike")
+
+    test.case("distinct on is refused outside postgres")
+    let d = locked([QbCol("id")], false)
+    test.assert_eq_str(sql_of(d, QbPostgres), "SELECT DISTINCT ON (id) * FROM users")
+    test.assert(refused(d, QbSqlite))
+    test.assert(refused(d, QbMysql))
+    test.assert_eq_str(render_error(d, QbSqlite), "distinct_on: sqlite has no distinct-on")
+
+    test.case("a plain distinct is not the same clause and is not refused")
+    let plain = QbStmtSelect(qbbuild.distinct(qbbuild.from(qbbuild.select(), "t", "")))
+    test.assert_eq_str(sql_of(plain, QbSqlite), "SELECT DISTINCT * FROM t")
+    test.assert_eq(list.len(faults_of(plain, QbSqlite)), 0)
+
+    test.case("a nulls ordering is refused in mysql")
+    let o = QbStmtSelect(qbbuild.order_by_nulls(users, "name", false, QbNullsLast))
+    test.assert_eq_str(sql_of(o, QbPostgres), "SELECT * FROM users AS u ORDER BY name NULLS LAST")
+    test.assert_eq_str(sql_of(o, QbSqlite), "SELECT * FROM users AS u ORDER BY name NULLS LAST")
+    test.assert(refused(o, QbMysql))
+    test.assert_eq(first_kind(o, QbMysql), "unsupported")
+    test.assert_eq_str(first_at(o, QbMysql), "order_by[0]")
+
+    test.case("a full join is refused in mysql")
+    let f = QbStmtSelect(qbbuild.join(users, QbFull, "orders", "o", QbIsNull(QbCol("x"), false)))
+    test.assert_eq_str(sql_of(f, QbPostgres),
+                       "SELECT * FROM users AS u FULL OUTER JOIN orders AS o ON x IS NULL")
+    test.assert_eq_str(sql_of(f, QbSqlite),
+                       "SELECT * FROM users AS u FULL OUTER JOIN orders AS o ON x IS NULL")
+    test.assert(refused(f, QbMysql))
+    test.assert_eq(first_kind(f, QbMysql), "unsupported")
+    test.assert_eq_str(first_at(f, QbMysql), "joins[0]")
+
+    test.case("a right join is not refused anywhere")
+    let r = QbStmtSelect(qbbuild.join(users, QbRight, "orders", "o", QbIsNull(QbCol("x"), false)))
+    test.assert_eq_str(sql_of(r, QbMysql),
+                       "SELECT * FROM users AS u RIGHT JOIN orders AS o ON x IS NULL")
+    test.assert_eq(list.len(faults_of(r, QbMysql)), 0)
+
+    test.case("for update is refused outside postgres and mysql")
+    let lk = locked([], true)
+    test.assert_eq_str(sql_of(lk, QbPostgres), "SELECT * FROM users FOR UPDATE")
+    test.assert_eq_str(sql_of(lk, QbMysql), "SELECT * FROM users FOR UPDATE")
+    test.assert(refused(lk, QbSqlite))
+    test.assert_eq_str(render_error(lk, QbSqlite), "sqlite has no for-update")
+
+    test.case("an anonymous subquery is refused where one is required")
+    let anon = qbbuild.from_select(qbbuild.select(),
+                                   qbbuild.from(qbbuild.select(), "users", ""), "")
+    test.assert_eq_str(sql_of(QbStmtSelect(anon), QbSqlite),
+                       "SELECT * FROM (SELECT * FROM users)")
+    test.assert(refused(QbStmtSelect(anon), QbPostgres))
+    test.assert(refused(QbStmtSelect(anon), QbMysql))
+    test.assert_eq(first_kind(QbStmtSelect(anon), QbPostgres), "subquery-needs-alias")
+    test.assert_eq_str(first_at(QbStmtSelect(anon), QbPostgres), "from")
+    test.assert(qberror.is_dialect_limit(list.get(faults_of(QbStmtSelect(anon), QbPostgres), 0)))
+
+@test
+fn test_every_dialect_is_usable_for_the_statements_it_can_say() [io]
+    let plain = QbStmtSelect(qbbuild.columns(qbbuild.from(qbbuild.select(), "users", ""),
+                                             ["id", "name"]))
+
+    test.case("a statement with no bind and no exotic clause renders for all four")
+    test.assert_eq_str(sql_of(plain, QbSqlite), "SELECT id, name FROM users")
+    test.assert_eq_str(sql_of(plain, QbPostgres), "SELECT id, name FROM users")
+    test.assert_eq_str(sql_of(plain, QbMysql), "SELECT id, name FROM users")
+    test.assert_eq_str(sql_of(plain, QbSqlEngine), "SELECT id, name FROM users")
+    for d in qbdialect.dialects()
+        test.assert_eq(list.len(faults_of(plain, d)), 0)
+
+    test.case("and every dialect names itself in a fault")
+    test.assert_eq_str(qbdialect.name(QbSqlEngine), "sql-engine")
+    test.assert_eq_str(qbdialect.name(QbSqlite), "sqlite")
+    test.assert_eq_str(qbdialect.name(QbPostgres), "postgres")
+    test.assert_eq_str(qbdialect.name(QbMysql), "mysql")
+
+    test.case("quote_all is refused where there is no quote character")
+    test.assert_eq_str(sql_with(plain, opts(QbSqlite, false, true, false, false, 64, 65535)),
+                       "SELECT \"id\", \"name\" FROM \"users\"")
+    test.assert_eq_str(sql_with(plain, opts(QbPostgres, false, true, false, false, 64, 65535)),
+                       "SELECT \"id\", \"name\" FROM \"users\"")
+    test.assert_eq_str(sql_with(plain, opts(QbMysql, false, true, false, false, 64, 65535)),
+                       "SELECT `id`, `name` FROM `users`")
+    test.assert_eq_str(sql_with(plain, opts(QbSqlEngine, false, true, false, false, 64, 65535)),
+                       "<refused>")
+    test.assert_eq_str(options_error(plain, opts(QbSqlEngine, false, true, false, false, 64, 65535)),
+                       "columns[0].expr: id is not a bare identifier and sql-engine cannot quote one")
+    test.assert_eq_str(refusal_kind(plain, opts(QbSqlEngine, false, true, false, false, 64, 65535)),
+                       "unquotable-ident")
+    test.case("while the same statement without quote_all renders for that dialect")
+    test.assert_eq_str(sql_of(plain, QbSqlEngine), "SELECT id, name FROM users")
+
+    test.case("the dialect rows answer for themselves")
+    test.assert_eq(qbdialect.quote_char(QbSqlEngine), 0)
+    test.assert_eq(qbdialect.quote_char(QbMysql), 96)
+    test.assert_eq_str(qbdialect.placeholder(QbPostgres, 0), "$1")
+    test.assert_eq_str(qbdialect.placeholder(QbPostgres, 4), "$5")
+    test.assert_eq_str(qbdialect.placeholder(QbSqlEngine, 4), "?")
+    test.assert_eq_str(qbdialect.placeholder(QbSqlite, 4), "?")
+    test.assert_eq_str(qbdialect.placeholder(QbMysql, 4), "?")
+    test.assert_eq_str(qbdialect.blob_prefix(QbSqlEngine), "X'")
+    test.assert_eq_str(qbdialect.blob_prefix(QbMysql), "0x")
+    test.assert_eq_str(qbdialect.blob_suffix(QbSqlEngine), "'")
+    test.assert_eq_str(qbdialect.blob_suffix(QbMysql), "")
+    test.assert(qbdialect.backslash_escapes(QbMysql))
+    test.assert(not qbdialect.backslash_escapes(QbSqlite))
+    test.assert(not qbdialect.is_bare_ident(QbSqlite, ""))
+    test.assert(not qbdialect.is_bare_ident(QbSqlite, keyword()))
+    test.assert(not qbdialect.is_reserved(QbSqlite, "id"))
+    test.assert(qbdialect.is_reserved(QbSqlite, keyword()))
+    test.assert_eq(list.len(qbdialect.features()), 18)
+    test.assert_eq(list.len(qbdialect.dialects()), 4)
+    test.assert_eq(list.len(qbdialect.reserved_words(QbSqlite)) > 60, true)
+    for f in qbdialect.features()
+        test.assert(str.len(qbdialect.feature_name(f)) > 0)
+        for d in qbdialect.dialects()
+            test.assert(qbdialect.supports(d, f) or not qbdialect.supports(d, f))
+
+// ── Malformed statements ─────────────────────────────────────────────
+
+@test
+fn test_a_malformed_statement_names_the_place_it_is_wrong() [io]
+    let users = qbbuild.from(qbbuild.select(), "users", "u")
+
+    test.case("a join with no condition names the join's own path")
+    let no_on = QbStmtSelect(
+        QbSelect { ctes: [], distinct: false, distinct_on: [], columns: [],
+                   from: Some(QbTable("a", "")),
+                   joins: [QbJoin { kind: QbInner, source: QbTable("b", ""), on: None },
+                           QbJoin { kind: QbLeft, source: QbTable("c", ""), on: None }],
+                   where_: None, group_by: [], having: None, order_by: [],
+                   limit: -1, offset: -1, set_arms: [], for_update: false })
+    test.assert_eq(list.len(faults_of(no_on, QbSqlite)), 2)
+    test.assert_eq_str(first_at(no_on, QbSqlite), "joins[0].on")
+    test.assert_eq_str(list.get(faults_of(no_on, QbSqlite), 1).at, "joins[1].on")
+    test.assert_eq_str(first_message(no_on, QbSqlite),
+        "joins[0].on: a join other than a cross join needs an ON condition; QbCross is how a cross join is written")
+    test.assert(refused(no_on, QbSqlite))
+
+    test.case("and a cross join with a condition is not that fault")
+    test.assert_eq_str(sql_of(QbStmtSelect(
+        QbSelect { ctes: [], distinct: false, distinct_on: [], columns: [],
+                   from: Some(QbTable("a", "")),
+                   joins: [QbJoin { kind: QbCross, source: QbTable("b", ""),
+                                    on: Some(QbCol("x")) }],
+                   where_: None, group_by: [], having: None, order_by: [],
+                   limit: -1, offset: -1, set_arms: [], for_update: false }),
+                   QbSqlite),
+        "SELECT * FROM a CROSS JOIN b")
+
+    test.case("an empty IN list names the clause it is on")
+    let empty = QbStmtSelect(qbbuild.where_(users, QbIn(QbCol("id"), [], false)))
+    test.assert_eq(first_kind(empty, QbSqlite), "empty-in-list")
+    test.assert_eq_str(first_message(empty, QbSqlite),
+        "where_: IN () has no values in it; guard the empty list or pick another condition")
+    test.assert(refused(empty, QbSqlite))
+    test.assert_eq_str(expr_of(qbbuild.in_values("id", []), QbSqlite), "<refused>")
+
+    test.case("a case with unequal halves names both counts")
+    let cs = QbStmtSelect(qbbuild.column_as(
+                 qbbuild.select(), QbCase([QbCol("a"), QbCol("b")], [QbLit(QbInt(1))], None), ""))
+    test.assert_eq(first_kind(cs, QbSqlite), "case-arity")
+    test.assert_eq_str(first_at(cs, QbSqlite), "columns[0].expr")
+    test.assert_eq_str(first_message(cs, QbSqlite),
+                       "columns[0].expr: CASE has 2 WHEN branch(es) and 1 THEN branch(es)")
+    test.assert(refused(cs, QbSqlite))
+
+    test.case("an ORDER BY inside a union arm is refused")
+    let arm = qbbuild.order_by(qbbuild.from(qbbuild.select(), "t", ""), "id", false)
+    let un = QbStmtSelect(qbbuild.union(users, QbUnion, arm))
+    test.assert_eq(first_kind(un, QbSqlite), "set-arm-ordered")
+    test.assert(refused(un, QbSqlite))
+
+    test.case("a recursive CTE writes the keyword")
+    let body = qbbuild.from(qbbuild.select(), "t", "")
+    let rec = QbStmtSelect(qbbuild.with_cte(users, "r", body, true))
+    test.assert_eq_str(sql_of(rec, QbSqlite),
+                       "WITH RECURSIVE r AS (SELECT * FROM t) SELECT * FROM users AS u")
+    let plain = QbStmtSelect(qbbuild.with_cte(users, "r", body, false))
+    test.assert_eq_str(sql_of(plain, QbSqlite),
+                       "WITH r AS (SELECT * FROM t) SELECT * FROM users AS u")
+
+    test.case("two CTEs render with a comma and one space, and a subquery in the first")
+    let two = QbStmtSelect(
+        qbbuild.with_cte(qbbuild.with_cte(users, "a", body, false), "b", body, false))
+    test.assert_eq_str(sql_of(two, QbSqlite),
+        "WITH a AS (SELECT * FROM t), b AS (SELECT * FROM t) SELECT * FROM users AS u")
+
+    test.case("an empty CTE name is refused, and a repeat is refused at the second")
+    let anon = QbStmtSelect(qbbuild.with_cte(users, "", body, false))
+    test.assert_eq(first_kind(anon, QbSqlite), "cte-name")
+    let twice = QbStmtSelect(
+        qbbuild.with_cte(qbbuild.with_cte(users, "x", body, false), "x", body, false))
+    test.assert_eq(first_kind(twice, QbSqlite), "cte-name")
+    test.assert_eq_str(first_at(twice, QbSqlite), "ctes[1]")
+    test.assert_eq_str(first_message(twice, QbSqlite),
+                       "ctes[1]: x is not a usable CTE name; a CTE name is non-empty and used once")
+
+@test
+fn test_an_insert_that_cannot_be_run_is_refused_before_it_is_written() [io]
+    test.case("no column list")
+    let bare = QbStmtInsert(qbbuild.values(qbbuild.insert("t", []), []))
+    test.assert_eq(first_kind(bare, QbSqlite), "insert-no-columns")
+    test.assert_eq_str(first_message(bare, QbSqlite),
+        "INSERT must name its columns; the table's declaration order is not visible here")
+
+    test.case("a column list with no row and no select")
+    let nosource = QbStmtInsert(qbbuild.insert("t", ["a"]))
+    test.assert_eq(first_kind(nosource, QbSqlite), "insert-no-source")
+    test.assert_eq_str(first_message(nosource, QbSqlite), "INSERT has neither rows nor a SELECT")
+
+    test.case("both sources")
+    let both = qbbuild.insert_select(
+                 qbbuild.values(qbbuild.insert("t", ["a"]), [qbbuild.int_value(1)]),
+                 qbbuild.from(qbbuild.select(), "u", ""))
+    test.assert_eq(first_kind(QbStmtInsert(both), QbSqlite), "insert-two-sources")
+    test.assert_eq_str(first_message(QbStmtInsert(both), QbSqlite),
+                       "INSERT has both rows and a SELECT")
+    test.assert(refused(QbStmtInsert(both), QbSqlite))
+
+    test.case("an insert from a select alone renders, with the source bracketed")
+    // The source goes through the same subquery writer the FROM clause
+    // uses, so it is written parenthesized: `INSERT INTO t (a)
+    // (SELECT …)`.  The standard grammar reads a bracketed query
+    // expression there, so all four dialects accept it; it is not the
+    // canonical spelling and the README does not claim one.
+    let from_sel = QbStmtInsert(qbbuild.insert_select(
+                       qbbuild.insert("t", ["a"]),
+                       qbbuild.from(qbbuild.select(), "u", "")))
+    test.assert_eq_str(sql_of(from_sel, QbSqlite), "INSERT INTO t (a) (SELECT * FROM u)")
+    test.assert_eq_str(sql_of(from_sel, QbPostgres), "INSERT INTO t (a) (SELECT * FROM u)")
+    test.assert_eq_str(sql_of(from_sel, QbMysql), "INSERT INTO t (a) (SELECT * FROM u)")
+    test.assert_eq(list.len(params_of(from_sel, QbSqlite)), 0)
+
+    test.case("a row of the wrong length names the row and both counts")
+    let short = qbbuild.values(qbbuild.insert("t", ["a", "b"]), [qbbuild.int_value(1)])
+    test.assert_eq(first_kind(QbStmtInsert(short), QbSqlite), "insert-arity")
+    test.assert_eq_str(first_at(QbStmtInsert(short), QbSqlite), "rows[0]")
+    test.assert_eq_str(first_message(QbStmtInsert(short), QbSqlite),
+                       "rows[0]: INSERT row 0 holds 1 value(s) for 2 column(s)")
+
+    test.case("and the second row is named as the second")
+    let two = qbbuild.values(
+                qbbuild.values(qbbuild.insert("t", ["a"]), [qbbuild.int_value(1)]),
+                [qbbuild.int_value(2), qbbuild.int_value(3)])
+    test.assert_eq_str(first_at(QbStmtInsert(two), QbSqlite), "rows[1]")
+
+    test.case("two good rows render as two brackets")
+    let good = qbbuild.values(
+                 qbbuild.values(qbbuild.insert("t", ["a"]), [qbbuild.int_value(1)]),
+                 [qbbuild.int_value(2)])
+    test.assert_eq_str(sql_of(QbStmtInsert(good), QbSqlite),
+                       "INSERT INTO t (a) VALUES (?), (?)")
+    test.assert_eq(list.len(params_of(QbStmtInsert(good), QbSqlite)), 2)
+
+    test.case("an update that sets nothing is refused")
+    let nothing = QbStmtUpdate(qbbuild.update("t"))
+    test.assert_eq(first_kind(nothing, QbSqlite), "update-nothing-set")
+    test.assert_eq_str(first_message(nothing, QbSqlite), "UPDATE sets no column")
+    test.assert(refused(nothing, QbSqlite))
+
+@test
+fn test_the_three_switches_refuse_what_they_are_for_and_nothing_else() [io]
+    let unguarded = QbStmtUpdate(qbbuild.set(qbbuild.update("t"),
+                                             qbbuild.assign("a", qbbuild.int_value(1))))
+    let guarded = QbStmtUpdate(qbbuild.update_where(
+                     qbbuild.set(qbbuild.update("t"),
+                                 qbbuild.assign("a", qbbuild.int_value(1))),
+                     qbbuild.eq("id", qbbuild.int_value(2))))
+    let raw = QbStmtSelect(qbbuild.where_(qbbuild.from(qbbuild.select(), "t", ""),
+                                          QbRaw("a = b")))
+
+    test.case("an unguarded write is a fact about the statement, before options")
+    test.assert(qbrender.unguarded(unguarded))
+    test.assert(not qbrender.unguarded(guarded))
+    test.assert(qbrender.unguarded(QbStmtDelete(qbbuild.delete("t"))))
+    test.assert(not qbrender.unguarded(QbStmtDelete(
+        qbbuild.delete_where(qbbuild.delete("t"), qbbuild.is_null("x")))))
+    test.assert(not qbrender.unguarded(QbStmtSelect(qbbuild.select())))
+
+    test.case("and it renders anyway by default")
+    test.assert_eq_str(sql_of(unguarded, QbSqlite), "UPDATE t SET a = ?")
+
+    test.case("require_where refuses it, naming the switch")
+    let strict = opts(QbSqlite, false, false, true, false, 64, 65535)
+    test.assert_eq_str(sql_with(unguarded, strict), "<refused>")
+    test.assert_eq_str(options_error(unguarded, strict),
+                       "an UPDATE or DELETE with no WHERE, and require_where is on")
+    test.assert_eq_str(refusal_kind(unguarded, strict), "where-required")
+
+    test.case("and leaves the guarded one alone")
+    test.assert_eq_str(sql_with(guarded, strict), "UPDATE t SET a = ? WHERE id = ?")
+    test.assert_eq_str(sql_with(QbStmtSelect(qbbuild.select()), strict), "SELECT *")
+
+    test.case("forbid_raw refuses spliced text, naming the switch")
+    test.assert_eq_str(sql_with(raw, qbrender.options(QbSqlite)), "SELECT * FROM t WHERE a = b")
+    test.assert_eq(qbrender.raw_sites(raw), 1)
+    test.assert_eq(qbrender.raw_sites(guarded), 0)
+    let strict_raw = opts(QbSqlite, false, false, false, true, 64, 65535)
+    test.assert_eq_str(sql_with(raw, strict_raw), "<refused>")
+    test.assert_eq_str(options_error(raw, strict_raw),
+                       "where_: the statement carries spliced text, and forbid_raw is on")
+    test.assert_eq_str(refusal_kind(raw, strict_raw), "raw-forbidden")
+
+    test.case("and the two switches are independent")
+    test.assert_eq_str(sql_with(raw, strict), "SELECT * FROM t WHERE a = b")
+    test.assert_eq_str(sql_with(unguarded, strict_raw), "UPDATE t SET a = ?")
+
+@test
+fn test_the_two_ceilings_are_faults_rather_than_crashes() [io]
+    let deep = QbStmtSelect(nested_select(3))
+    let bound = QbStmtSelect(qbbuild.where_(
+                    qbbuild.from(qbbuild.select(), "t", ""),
+                    QbIn(QbCol("id"),
+                         [QbBind(QbInt(1)), QbBind(QbInt(2)), QbBind(QbInt(3))], false)))
+
+    test.case("the default ceiling lets both through")
+    test.assert_eq_str(sql_of(deep, QbSqlite),
+                       "SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM users)))")
+    test.assert_eq(qbast.depth(deep), 3)
+    test.assert_eq(list.len(params_of(bound, QbSqlite)), 3)
+
+    test.case("a depth ceiling refuses the statement that passes it")
+    let shallow = opts(QbSqlite, false, false, false, false, 2, 65535)
+    test.assert_eq_str(sql_with(deep, shallow), "<refused>")
+    test.assert_eq_str(options_error(deep, shallow), "the statement nests deeper than 2")
+
+    test.case("depth counts subqueries and not the operators inside one")
+    test.assert_eq(qbast.depth(QbStmtSelect(qbbuild.where_(
+                     qbbuild.from(qbbuild.select(), "t", ""),
+                     QbNot(QbNot(QbNot(QbNot(QbCol("a")))))))),
+                     0)
+
+    test.case("a parameter ceiling refuses at the count it is given")
+    let narrow = opts(QbSqlite, false, false, false, false, 64, 2)
+    test.assert_eq_str(sql_with(bound, narrow), "<refused>")
+    test.assert_eq_str(options_error(bound, narrow),
+                       "the statement binds more than 2 values")
+    test.assert_eq_str(sql_with(bound, opts(QbSqlite, false, false, false, false, 64, 3)),
+                       "SELECT * FROM t WHERE id IN (?, ?, ?)")
+
+    test.case("a render stops at the first fault, while check lists every one")
+    let two_ways = QbStmtSelect(
+        QbSelect { ctes: [], distinct: false, distinct_on: [], columns: [],
+                   from: Some(QbTable("a", "")),
+                   joins: [QbJoin { kind: QbInner, source: QbTable("b", ""), on: None }],
+                   where_: Some(QbIn(QbCol("id"), [], false)), group_by: [],
+                   having: None, order_by: [], limit: -1, offset: -1,
+                   set_arms: [], for_update: false })
+    test.assert_eq(list.len(faults_of(two_ways, QbSqlite)), 2)
+    test.assert_eq_str(first_kind(two_ways, QbSqlite), "join-without-on")
+    test.assert_eq_str(first_at(two_ways, QbSqlite), "joins[0].on")
+    test.assert_eq_str(render_error(two_ways, QbSqlite),
+        "joins[0].on: a join other than a cross join needs an ON condition; QbCross is how a cross join is written")
+    test.assert(refused(two_ways, QbSqlite))
+
+@test
+fn test_every_fault_kind_answers_a_name_and_a_sentence() [io]
+    test.case("all eighteen kinds are named, none of them twice, none empty")
+    let kinds = [QbJoinWithoutOn, QbEmptyInList, QbCaseArity(2, 1),
+                 QbInsertArity(2, 1, 0), QbInsertNoColumns, QbInsertTwoSources,
+                 QbInsertNoSource, QbUpdateNothingSet,
+                 QbUnquotableIdent("user", QbSqlEngine), QbUnwritableIdent("a"),
+                 QbUnsupported(QbFeatReturning, QbMysql), QbSubqueryNeedsAlias,
+                 QbCteName("x"), QbSetArmOrdered, QbTooDeep(1),
+                 QbTooManyParams(1), QbWhereRequired, QbRawForbidden]
+    test.assert_eq(list.len(kinds), 18)
+    var names: [Str] = []
+    for k in kinds
+        let name = qberror.kind_name(k)
+        let message = qberror.message(qberror.fault(k, ""))
+        test.assert(str.len(name) > 0)
+        test.assert(str.len(message) > 0)
+        test.assert(not str.contains(name, " "))
+        test.assert(not str.contains(message, nl()))
+        test.assert(not list.contains(names, name))
+        list.push(names, name)
+
+    test.case("a fault with a path spells the path in front of the sentence")
+    test.assert_eq_str(qberror.message(qberror.fault(QbJoinWithoutOn, "joins[2].on")),
+        "joins[2].on: a join other than a cross join needs an ON condition; QbCross is how a cross join is written")
+    test.assert_eq_str(qberror.message(qberror.fault(QbJoinWithoutOn, "")),
+        "a join other than a cross join needs an ON condition; QbCross is how a cross join is written")
+
+    test.case("a dialect fault names the dialect")
+    test.assert_eq_str(qberror.message(qberror.fault(QbUnsupported(QbFeatILike, QbMysql), "where_")),
+                       "where_: mysql has no ilike")
+    test.assert_eq_str(qberror.message(qberror.fault(QbUnquotableIdent("user", QbSqlEngine), "columns[0].expr")),
+                       "columns[0].expr: user is not a bare identifier and sql-engine cannot quote one")
+    test.assert_eq_str(qberror.message(qberror.fault(QbUnwritableIdent("a"), "")),
+                       "a holds a quote or a zero byte, which no dialect can write in an identifier")
+
+    test.case("a fault is an Error, which is what lets it be the Err of a Result")
+    test.assert_eq_str(render_error(join_without_on(), QbSqlite),
+        "joins[0].on: a join other than a cross join needs an ON condition; QbCross is how a cross join is written")
+
+    test.case("and the two lists split on exactly the documented three kinds")
+    let limits = qberror.dialect_limits(faults_of(by_name("x"), QbSqlEngine))
+    test.assert_eq(list.len(limits), 1)
+    test.assert_eq(list.len(qberror.malformed(faults_of(by_name("x"), QbSqlEngine))), 0)
+    test.assert(qberror.is_dialect_limit(list.get(limits, 0)))
+    test.assert_eq(list.len(qberror.dialect_limits(faults_of(by_name("x"), QbSqlite))), 0)
+    test.assert_eq(list.len(qberror.dialect_limits(
+        faults_of(join_without_on(), QbSqlite))),
+        0)
+
+// ── The expression vocabulary ────────────────────────────────────────
+
+@test
+fn test_the_expression_vocabulary_renders() [io]
+    test.case("the literals")
+    test.assert_eq_str(literal_of(QbInt(-7), QbSqlite), "-7")
+    test.assert_eq_str(literal_of(QbInt(0), QbSqlite), "0")
+    test.assert_eq_str(literal_of(QbFloat(1.5), QbSqlite), "1.5")
+    test.assert_eq_str(literal_of(QbBool(false), QbSqlite), "0")
+    test.assert_eq_str(literal_of(QbBool(true), QbPostgres), "TRUE")
+    test.assert_eq_str(literal_of(QbNull, QbSqlite), "NULL")
+    test.assert_eq_str(literal_of(QbText(""), QbSqlite), "''")
+    test.assert_eq_str(literal_of(QbBlob([65 as u8]), QbSqlite), "X'41'")
+
+    test.case("a case with an else, and a case without")
+    test.assert_eq_str(
+        expr_of(QbCase([QbIsNull(QbCol("a"), false)], [QbLit(QbInt(1))], Some(QbLit(QbInt(0)))),
+                QbSqlite),
+        "CASE WHEN a IS NULL THEN 1 ELSE 0 END")
+    test.assert_eq_str(
+        expr_of(QbCase([QbCmp(QbEq, QbCol("a"), QbLit(QbInt(1)))], [QbLit(QbText("one"))], None),
+                QbSqlite),
+        "CASE WHEN a = 1 THEN 'one' END")
+
+    test.case("a like with an escape clause, and the built pattern that needs one")
+    test.assert_eq_str(expr_of(QbLike(QbCol("name"), QbBind(QbText("100")), "\\", false), QbSqlite),
+                       "name LIKE ? ESCAPE '\\'")
+    test.assert_eq_str(expr_of(qbbuild.like("name", "%"), QbSqlite), "name LIKE ?")
+    test.assert_eq_str(qbbuild.escape_like("100%"), "100\\%")
+    test.assert_eq_str(qbbuild.escape_like("a_b"), "a\\_b")
+    test.assert_eq_str(qbbuild.escape_like("a\\b"), "a\\\\b")
+    test.assert_eq_str(qbbuild.escape_like("plain"), "plain")
+
+    test.case("a negated between, a negated in and a not")
+    test.assert_eq_str(
+        expr_of(QbNot(QbBetween(QbCol("age"), QbBind(QbInt(18)), QbBind(QbInt(30)), true)),
+                QbSqlite),
+        "NOT (age NOT BETWEEN ? AND ?)")
+    test.assert_eq_str(
+        expr_of(QbNot(QbIn(QbCol("id"), [QbBind(QbInt(1))], true)), QbSqlite),
+        "NOT (id NOT IN (?))")
+
+    test.case("exists, a scalar subquery and a qualified star")
+    test.assert_eq_str(expr_of(QbExists(qbbuild.from(qbbuild.select(), "t", ""), true), QbSqlite),
+                       "NOT EXISTS (SELECT * FROM t)")
+    test.assert_eq_str(expr_of(QbCmp(QbGt, QbScalar(qbbuild.from(qbbuild.select(), "t", "")),
+                                     QbQualStar("u")),
+                                     QbSqlite),
+                       "(SELECT * FROM t) > u.*")
+
+    test.case("a subquery in an in list, and its negation")
+    test.assert_eq_str(expr_of(QbInSelect(QbCol("id"),
+                                          qbbuild.from(qbbuild.select(), "t", ""), true),
+                                          QbSqlite),
+                       "id NOT IN (SELECT * FROM t)")
+
+    test.case("a function, an aggregate, a distinct aggregate and a cast")
+    test.assert_eq_str(expr_of(QbFn("LOWER", [QbCol("name")]), QbSqlite), "LOWER(name)")
+    test.assert_eq_str(expr_of(QbAgg("COUNT", [QbCol("x")], true, None), QbSqlite),
+                       "COUNT(DISTINCT x)")
+    test.assert_eq_str(expr_of(QbAgg("COUNT", [QbStar], false, None), QbSqlite), "COUNT(*)")
+    test.assert_eq_str(expr_of(QbCast(QbCol("id"), "TEXT"), QbSqlite), "CAST(id AS TEXT)")
+
+    test.case("an aggregate with a filter")
+    test.assert_eq_str(expr_of(QbAgg("COUNT", [QbStar], false,
+                                     Some(QbCmp(QbGt, QbCol("x"), QbLit(QbInt(0))))),
+                                     QbSqlite),
+                       "COUNT(*) FILTER (WHERE x > 0)")
+
+    test.case("coalesce and the arithmetic operators")
+    test.assert_eq_str(expr_of(QbCoalesce([QbCol("a"), QbLit(QbInt(0))]), QbSqlite),
+                       "COALESCE(a, 0)")
+    test.assert_eq_str(expr_of(QbBinop(QbAdd, QbLit(QbInt(1)), QbLit(QbInt(2))), QbSqlite),
+                       "1 + 2")
+    test.assert_eq_str(expr_of(QbBinop(QbMul,
+                                       QbBinop(QbAdd, QbLit(QbInt(1)), QbLit(QbInt(2))),
+                                       QbLit(QbInt(3))),
+                                       QbSqlite),
+                       "(1 + 2) * 3")
+    test.assert_eq_str(expr_of(QbCmp(QbEq, QbCol("a"), QbBinop(QbAdd, QbCol("b"), QbCol("c"))),
+                               QbSqlite),
+                       "a = (b + c)")
+
+    test.case("every comparison operator")
+    test.assert_eq_str(expr_of(qbbuild.eq("a", qbbuild.int_value(1)), QbSqlite), "a = ?")
+    test.assert_eq_str(expr_of(qbbuild.ne("a", qbbuild.int_value(1)), QbSqlite), "a <> ?")
+    test.assert_eq_str(expr_of(qbbuild.lt("a", qbbuild.int_value(1)), QbSqlite), "a < ?")
+    test.assert_eq_str(expr_of(qbbuild.le("a", qbbuild.int_value(1)), QbSqlite), "a <= ?")
+    test.assert_eq_str(expr_of(qbbuild.gt("a", qbbuild.int_value(1)), QbSqlite), "a > ?")
+    test.assert_eq_str(expr_of(qbbuild.ge("a", qbbuild.int_value(1)), QbSqlite), "a >= ?")
+    test.assert_eq_str(expr_of(qbbuild.is_null("a"), QbSqlite), "a IS NULL")
+    test.assert_eq_str(expr_of(qbbuild.is_not_null("a"), QbSqlite), "a IS NOT NULL")
+    test.assert_eq_str(expr_of(qbbuild.in_values("a", [qbbuild.int_value(1), qbbuild.int_value(2)]),
+                               QbSqlite),
+                       "a IN (?, ?)")
+    test.assert_eq_str(expr_of(qbbuild.between("a", qbbuild.int_value(1), qbbuild.int_value(2)),
+                               QbSqlite),
+                       "a BETWEEN ? AND ?")
+
+    test.case("the two folds, and the empty fold's opposite identities")
+    test.assert_eq_str(sql_of(QbStmtSelect(qbbuild.where_(qbbuild.select(),
+                                                          qbbuild.any_of([]))),
+                                                          QbSqlite),
+                       "SELECT * WHERE 0")
+    test.assert_eq_str(sql_of(QbStmtSelect(qbbuild.where_(qbbuild.select(),
+                                                          qbbuild.all_of([]))),
+                                                          QbSqlite),
+                       "SELECT * WHERE 1")
+    test.assert_eq_str(expr_of(qbbuild.all_of([qbbuild.is_null("a")]), QbSqlite), "a IS NULL")
+    test.assert_eq_str(expr_of(qbbuild.any_of([qbbuild.is_null("a"), qbbuild.is_null("b"),
+                                               qbbuild.is_null("c")]),
+                                               QbSqlite),
+                       "(a IS NULL OR b IS NULL) OR c IS NULL")
+
+    test.case("a raw is spliced as written")
+    test.assert_eq_str(expr_of(QbRaw("a = b"), QbSqlite), "a = b")
+
+// ── The builder's own entry points ───────────────────────────────────
+
+@test
+fn test_the_builder_entry_points_produce_the_statement_they_promise() [io]
+    let users = qbbuild.from(qbbuild.select(), "users", "")
+
+    test.case("distinct, paging, paging from page two, and the count beside them")
+    test.assert_eq_str(sql_of(QbStmtSelect(qbbuild.distinct(
+                                 qbbuild.from(qbbuild.select(), "t", ""))),
+                                 QbSqlite),
+                       "SELECT DISTINCT * FROM t")
+    test.assert_eq_str(sql_of(QbStmtSelect(qbbuild.page(
+                                 qbbuild.from(qbbuild.select(), "t", ""), 2, 25)),
+                                 QbSqlite),
+                       "SELECT * FROM t LIMIT 25 OFFSET 50")
+    test.assert_eq_str(sql_of(QbStmtSelect(qbbuild.page(
+                                 qbbuild.from(qbbuild.select(), "t", ""), 0, 10)),
+                                 QbSqlite),
+                       "SELECT * FROM t LIMIT 10 OFFSET 0")
+    let counted = qbbuild.count_of(
+                    qbbuild.limit(qbbuild.and_where(qbbuild.from(qbbuild.select(), "t", ""),
+                                                    qbbuild.is_null("x")),
+                                                    10))
+    test.assert_eq_str(sql_of(QbStmtSelect(counted), QbSqlite),
+                       "SELECT COUNT(*) FROM t WHERE x IS NULL")
+
+    test.case("an ordering term, ascending, descending and nulls first")
+    test.assert_eq_str(sql_of(QbStmtSelect(qbbuild.order_by(users, "id", false)), QbSqlite),
+                       "SELECT * FROM users ORDER BY id")
+    test.assert_eq_str(sql_of(QbStmtSelect(qbbuild.order_by(users, "id", true)), QbSqlite),
+                       "SELECT * FROM users ORDER BY id DESC")
+    test.assert_eq_str(sql_of(QbStmtSelect(qbbuild.order_by_nulls(users, "id", true, QbNullsFirst)),
+                              QbSqlite),
+                       "SELECT * FROM users ORDER BY id DESC NULLS FIRST")
+
+    test.case("and an ordering term with the default nulls placement writes nothing extra")
+    test.assert_eq_str(sql_of(QbStmtSelect(qbbuild.order_by_nulls(users, "id", false,
+                                                                  QbNullsDefault)),
+                                                                  QbSqlite),
+                       "SELECT * FROM users ORDER BY id")
+
+    test.case("several orderings, and several groupings, in the order they were added")
+    let ordered = qbbuild.order_by(qbbuild.order_by(users, "id", false), "name", true)
+    test.assert_eq_str(sql_of(QbStmtSelect(ordered), QbSqlite),
+                       "SELECT * FROM users ORDER BY id, name DESC")
+    let grouped = qbbuild.group_by(qbbuild.group_by(users, "a"), "b")
+    test.assert_eq_str(sql_of(QbStmtSelect(grouped), QbSqlite),
+                       "SELECT * FROM users GROUP BY a, b")
+
+    test.case("a column as an expression, with and without a name")
+    test.assert_eq_str(sql_of(QbStmtSelect(qbbuild.column_as(
+                                 qbbuild.select(), QbCol("a"), "n")),
+                                 QbSqlite),
+                       "SELECT a AS n")
+    test.assert_eq_str(sql_of(QbStmtSelect(qbbuild.column(qbbuild.select(), "a")), QbSqlite),
+                       "SELECT a")
+    test.assert_eq_str(sql_of(QbStmtSelect(qbbuild.columns(qbbuild.select(), ["a", "b"])), QbSqlite),
+                       "SELECT a, b")
+    test.assert_eq_str(sql_of(QbStmtSelect(qbbuild.column_as(
+                                 qbbuild.column(qbbuild.select(), "a"), QbCol("b"), "c")),
+                                 QbSqlite),
+                       "SELECT a, b AS c")
+
+    test.case("where replaces and and_where adds, which is the difference that matters")
+    let a = qbbuild.where_(users, qbbuild.is_null("x"))
+    test.assert_eq_str(sql_of(QbStmtSelect(qbbuild.where_(a, qbbuild.is_null("y"))), QbSqlite),
+                       "SELECT * FROM users WHERE y IS NULL")
+    test.assert_eq_str(sql_of(QbStmtSelect(qbbuild.and_where(a, qbbuild.is_null("y"))), QbSqlite),
+                       "SELECT * FROM users WHERE x IS NULL AND y IS NULL")
+    test.assert_eq_str(sql_of(QbStmtSelect(qbbuild.or_where(a, qbbuild.is_null("y"))), QbSqlite),
+                       "SELECT * FROM users WHERE x IS NULL OR y IS NULL")
+
+    test.case("a join of each kind, and a second join")
+    for k in [QbInner, QbLeft, QbRight, QbCross]
+        test.assert_eq(list.len(qbbuild.join(users, k, "b", "", qbbuild.is_null("x")).joins), 1)
+    test.assert_eq_str(sql_of(QbStmtSelect(qbbuild.join(users, QbLeft, "b", "bb",
+                                                        qbbuild.eq("id", qbbuild.int_value(1)))),
+                              QbSqlite),
+                       "SELECT * FROM users LEFT JOIN b AS bb ON id = ?")
+    test.assert_eq_str(sql_of(QbStmtSelect(qbbuild.join(users, QbCross, "b", "",
+                                                        qbbuild.is_null("x"))),
+                                                        QbSqlite),
+                       "SELECT * FROM users CROSS JOIN b")
+
+    test.case("from_select has an alias, and from without one writes none")
+    test.assert_eq_str(sql_of(QbStmtSelect(qbbuild.from_select(
+                                 qbbuild.select(), qbbuild.select(), "s")),
+                                 QbSqlite),
+                       "SELECT * FROM (SELECT *) AS s")
+    test.assert_eq_str(sql_of(QbStmtSelect(qbbuild.from(qbbuild.select(), "t", "")), QbSqlite),
+                       "SELECT * FROM t")
+
+    test.case("the shorthands agree with the long way round")
+    test.assert_eq_str(sql_of(QbStmtSelect(qbbuild.where_(users,
+                                                          qbbuild.eq("id", qbbuild.int_value(1)))),
+                              QbSqlite),
+                       sql_of(QbStmtSelect(qbbuild.where_(
+                                 users, QbCmp(QbEq, QbCol("id"), QbBind(QbInt(1))))),
+                                 QbSqlite))
+    test.assert_eq_str(sql_of(QbStmtSelect(qbbuild.and_having(
+                                 qbbuild.group_by(users, "c"),
+                                 qbbuild.gt("n", qbbuild.int_value(1)))),
+                                 QbSqlite),
+                       "SELECT * FROM users GROUP BY c HAVING n > ?")
+
+    test.case("assign and assign_expr set a column two ways")
+    test.assert_eq_str(sql_of(QbStmtUpdate(qbbuild.update_where(
+                                 qbbuild.set(qbbuild.update("t"),
+                                             qbbuild.assign_expr("a",
+                                                 QbBinop(QbAdd, QbCol("a"), QbLit(QbInt(1))))),
+                                 qbbuild.eq("id", qbbuild.int_value(2)))),
+                                 QbSqlite),
+                       "UPDATE t SET a = a + 1 WHERE id = ?")
+
+    test.case("the value constructors build the five kinds of value")
+    test.assert_eq(text_of(qbbuild.text_value("x")), "x")
+    test.assert_eq(qbbuild.int_value(3), QbInt(3))
+    test.assert_eq(qbbuild.float_value(1.5), QbFloat(1.5))
+    test.assert_eq(qbbuild.bool_value(true), QbBool(true))
+    test.assert_eq(qbbuild.blob_value([1 as u8, 2 as u8]), QbBlob([1 as u8, 2 as u8]))
+
+// ── The corners of the text ──────────────────────────────────────────
+
+@test
+fn test_pretty_printing_moves_the_same_tokens_onto_their_own_lines() [io]
+    let st = QbStmtSelect(qbbuild.and_where(
+                 qbbuild.columns(qbbuild.from(qbbuild.select(), "users", ""), ["id"]),
+                 qbbuild.eq("id", qbbuild.int_value(1))))
+
+    test.case("flat is one line, with one space at each clause boundary")
+    test.assert_eq_str(sql_of(st, QbSqlite), "SELECT id FROM users WHERE id = ?")
+
+    test.case("pretty is the same words with the boundaries broken")
+    let pretty = sql_with(st, opts(QbSqlite, true, false, false, false, 64, 65535))
+    test.assert_eq_str(pretty, "SELECT id\n  FROM users\n  WHERE id = ?")
+
+    test.case("the two carry the same identifiers and the same values")
+    test.assert(str.len(pretty) > str.len(sql_of(st, QbSqlite)))
+    test.assert(str.contains(pretty, "WHERE id = ?"))
+    test.assert(params_of(st, QbSqlite) == params_of(st, QbSqlite))
+
+    test.case("a statement that is refused is refused under either flag")
+    let bad = join_without_on()
+    test.assert_eq_str(sql_with(bad, opts(QbSqlite, true, false, false, false, 64, 65535)),
+                       "<refused>")
+    test.assert_eq_str(render_error(bad, QbSqlite),
+        "joins[0].on: a join other than a cross join needs an ON condition; QbCross is how a cross join is written")
+
+    test.case("a statement with every clause breaks at every one of them")
+    // The clause boundaries are the gaps and only the gaps: a join
+    // rides on the FROM line it was added to, and a set arm's `SELECT`
+    // rides on the HAVING line, while the arm's own clauses break like
+    // any other select's.  Pinned as it is, because the flat form is
+    // the one a server reads and nothing else asserts this shape.
+    let wide = wide_statement()
+    let pretty_wide = sql_with(wide, opts(QbPostgres, true, false, false, false, 64, 65535))
+    test.assert_eq_str(pretty_wide,
+        "SELECT id, name\n  FROM users AS u INNER JOIN orders AS o ON o.user_id = $1" +
+        "\n  WHERE tenant = $2 AND age < $3\n  GROUP BY country" +
+        "\n  HAVING COUNT(*) > $4 UNION ALL SELECT *\n  FROM archive" +
+        "\n  WHERE tenant = $5\n  ORDER BY name")
+    test.assert(str.contains(pretty_wide, nl()))
+
+    test.case("and the flat form carries the same words without a newline")
+    test.assert(not str.contains(sql_of(wide, QbPostgres), nl()))
+    test.assert_eq(str.len(pretty_wide) > str.len(sql_of(wide, QbPostgres)), true)
+
+@test
+fn test_the_cannot_build_list_is_what_the_readme_says() [io]
+    let listed = qbrender.cannot_build()
+
+    test.case("nine entries, one line each, none empty")
+    test.assert_eq(list.len(listed), 9)
+    for line in listed
+        test.assert(str.len(line) > 0)
+        test.assert(not str.contains(line, nl()))
+
+    test.case("and each one names the thing it is about")
+    test.assert(str.contains(list.get(listed, 0), "CREATE"))
+    test.assert(str.contains(list.get(listed, 5), "comment"))
+    test.assert(str.contains(list.get(listed, 8), "device"))
+
+// ── The clauses no builder in `qbbuild` can build ────────────────────
+//
+// A `WITH` list on a write, a `FROM` on an `UPDATE`, a `FROM SELECT` on
+// an `INSERT` and every clause of a `DELETE` are fields a caller of the
+// `pub struct`s can set and no entry point in `qbbuild` can, so the
+// three released suites never build one — and a clause nothing builds
+// is a clause nothing walks.  The walk is what numbers the parameters,
+// so the statements below are WALKED as well as rendered: a clause the
+// walk skips is a placeholder that lands late, and a placeholder that
+// lands late puts a value in the wrong column rather than in the wrong
+// order.
+
+// A select with one bind in it, for use as a CTE body, a set arm or an
+// `INSERT`'s source.
+fn body_of(v: Str) -> qbast.QbSelect
+    QbSelect { ctes: [], distinct: false, distinct_on: [],
+               columns: [QbColumn { expr: QbStar, as_name: "" }],
+               from: Some(QbTable("u", "")), joins: [],
+               where_: Some(QbBind(QbText(v))), group_by: [], having: None,
+               order_by: [], limit: -1, offset: -1, set_arms: [],
+               for_update: false }
+
+fn cte_of(name: Str, columns: [Str], body: qbast.QbSelect, recursive: Bool) -> qbast.QbCte
+    QbCte { name: name, columns: columns, body: body, recursive: recursive }
+
+fn item(e: qbast.QbExpr, as_name: Str) -> qbast.QbColumn
+    QbColumn { expr: e, as_name: as_name }
+
+fn assignment(column: Str, e: qbast.QbExpr) -> qbast.QbAssign
+    QbAssign { column: column, value: e }
+
+// `WITH c AS (…), DELETE FROM t WHERE … RETURNING …`.
+fn delete_all_clauses() -> qbast.QbStmt
+    QbStmtDelete(QbDelete {
+        ctes: [cte_of("c", [], body_of("del-c"), false)],
+        table: "t",
+        where_: Some(QbBind(QbText("del-w"))),
+        returning: [item(QbBind(QbText("del-r")), "")] })
+
+// The same statement with nothing on it, which is the shape
+// `qbrender.unguarded` exists to find.
+fn delete_bare() -> qbast.QbStmt
+    QbStmtDelete(QbDelete { ctes: [], table: "t", where_: None,
+                            returning: [] })
+
+// `WITH c (a, b) AS (…), UPDATE t SET …, FROM …, WHERE … RETURNING …`.
+fn update_all_clauses() -> qbast.QbStmt
+    QbStmtUpdate(QbUpdate {
+        ctes: [cte_of("c", ["a", "b"], body_of("upd-c"), false)],
+        table: "t",
+        set: [assignment("a", QbBind(QbText("upd-s")))],
+        from: Some(QbTable("s", "x")),
+        where_: Some(QbBind(QbText("upd-w"))),
+        returning: [item(QbCol("a"), "")] })
+
+fn update_without_from() -> qbast.QbStmt
+    QbStmtUpdate(QbUpdate {
+        ctes: [], table: "t",
+        set: [assignment("a", QbBind(QbText("u2")))],
+        from: None, where_: Some(QbBind(QbText("u3"))), returning: [] })
+
+// `WITH c AS (…), INSERT INTO t (…), SELECT …, ON CONFLICT (…) DO
+// UPDATE SET … WHERE …, RETURNING …` — every field of `QbInsert` that
+// no builder in `qbbuild` sets.
+fn insert_all_clauses() -> qbast.QbStmt
+    QbStmtInsert(QbInsert {
+        ctes: [cte_of("c", [], body_of("ins-c"), false)],
+        table: "t", columns: ["a", "b"], rows: [],
+        from_select: Some(body_of("ins-src")),
+        conflict: QbConflictUpdate,
+        conflict_columns: ["a"],
+        conflict_set: [assignment("b", QbBind(QbText("ins-set")))],
+        conflict_where: Some(QbBind(QbText("ins-where"))),
+        returning: [item(QbBind(QbText("ins-ret")), "")] })
+
+@test
+fn test_the_walk_reaches_the_clauses_of_a_write() [io]
+    test.case("a delete: the cte, then the where, then the returning")
+    let del = delete_all_clauses()
+    test.assert_eq_str(sql_of(del, QbPostgres),
+        "WITH c AS (SELECT * FROM u WHERE $1) DELETE FROM t WHERE $2" +
+        " RETURNING $3")
+    test.assert_eq(list.len(qbast.binds_of(del)), 3)
+    test.assert_eq(list.len(qbast.tables_of(del)), 2)
+    test.assert_eq(qbast.depth(del), 0)
+    test.assert_eq(qbast.raw_count(del), 0)
+    test.assert(qbast.is_write(del))
+    test.assert_eq_str(qbast.target_table(del), "t")
+    test.assert(not qbrender.unguarded(del))
+
+    test.case("and the same statement with nothing on it is the unguarded one")
+    let bare = delete_bare()
+    test.assert_eq_str(sql_of(bare, QbPostgres), "DELETE FROM t")
+    test.assert_eq(list.len(qbast.binds_of(bare)), 0)
+    test.assert_eq(list.len(qbast.tables_of(bare)), 1)
+    test.assert(qbrender.unguarded(bare))
+    test.assert_eq_str(qbast.target_table(bare), "t")
+
+    test.case("an update: cte, assignments, FROM, where, returning")
+    let upd = update_all_clauses()
+    test.assert_eq_str(sql_of(upd, QbPostgres),
+        "WITH c (a, b) AS (SELECT * FROM u WHERE $1) UPDATE t SET a = $2" +
+        " FROM s AS x WHERE $3 RETURNING a")
+    test.assert_eq(list.len(qbast.binds_of(upd)), 3)
+    test.assert_eq(list.len(qbast.tables_of(upd)), 3)
+    test.assert(not qbrender.unguarded(upd))
+    test.assert_eq_str(qbast.target_table(upd), "t")
+
+    test.case("an update with no FROM walks the same list without one")
+    let u2 = update_without_from()
+    test.assert_eq_str(sql_of(u2, QbPostgres), "UPDATE t SET a = $1 WHERE $2")
+    test.assert_eq(list.len(qbast.binds_of(u2)), 2)
+    test.assert_eq(list.len(qbast.tables_of(u2)), 1)
+    test.assert_eq(qbast.depth(u2), 0)
+
+    test.case("and an update with no WHERE either is the other unguarded one")
+    let u3 = QbStmtUpdate(QbUpdate {
+        ctes: [], table: "t",
+        set: [assignment("a", QbBind(QbText("u4")))],
+        from: None, where_: None, returning: [] })
+    test.assert(qbrender.unguarded(u3))
+    test.assert_eq(list.len(qbast.binds_of(u3)), 1)
+    test.assert_eq(list.len(qbast.tables_of(u3)), 1)
+    test.assert_eq_str(sql_of(u3, QbPostgres), "UPDATE t SET a = $1")
+
+    test.case("an insert: cte, source, conflict set, its where, returning")
+    let ins = insert_all_clauses()
+    test.assert_eq_str(sql_of(ins, QbPostgres),
+        "WITH c AS (SELECT * FROM u WHERE $1) INSERT INTO t (a, b)" +
+        " (SELECT * FROM u WHERE $2) ON CONFLICT (a) DO UPDATE SET b = $3" +
+        " WHERE $4 RETURNING $5")
+    test.assert_eq(list.len(qbast.binds_of(ins)), 5)
+    test.assert_eq(list.len(qbast.tables_of(ins)), 2)
+    test.assert_eq(qbast.depth(ins), 1)
+    test.assert(not qbrender.unguarded(ins))
+    test.assert_eq_str(qbast.target_table(ins), "t")
+
+    test.case("the parameters are the tree's values in the text's order")
+    test.assert(params_of(ins, QbPostgres) == qbast.binds_of(ins))
+    let ips = params_of(ins, QbPostgres)
+    test.assert_eq(text_of(list.get(ips, 0)), "ins-c")
+    test.assert_eq(text_of(list.get(ips, 1)), "ins-src")
+    test.assert_eq(text_of(list.get(ips, 2)), "ins-set")
+    test.assert_eq(text_of(list.get(ips, 3)), "ins-where")
+    test.assert_eq(text_of(list.get(ips, 4)), "ins-ret")
+
+// A select carrying every clause, and inside them every expression
+// shape whose placeholder is written somewhere other than where the
+// tree holds it: a filter after the aggregate's arguments, a CASE's
+// branches between its WHENs and its THENs, an arm after the arm before
+// it, and a raw splice that is a number of bindings nobody can count.
+fn grammar_statement() -> qbast.QbStmt
+    QbStmtSelect(QbSelect {
+        ctes: [cte_of("r", ["a", "b"], body_of("g-cte"), true)],
+        distinct: false,
+        distinct_on: [QbBind(QbText("g-on"))],
+        columns: [item(QbQualStar("u"), ""),
+                  item(QbLit(QbInt(7)), "seven"),
+                  item(QbRaw("1 + 1"), "")],
+        from: Some(QbCteRef("r", "x")),
+        joins: [QbJoin { kind: QbCross, source: QbTable("o", ""), on: None }],
+        where_: Some(QbAnd(
+            QbBinop(QbAdd, QbCol("a"), QbCol("b")),
+            QbAnd(QbInSelect(QbCol("id"), body_of("g-in"), false),
+                  QbAnd(QbAgg("count", [QbCol("k")], true,
+                              Some(QbBind(QbText("g-f")))),
+                        QbCase([QbBind(QbText("g-w"))],
+                               [QbBind(QbText("g-t"))],
+                               Some(QbBind(QbText("g-e")))))))),
+        group_by: [QbCol("k")],
+        having: Some(QbBind(QbText("g-h"))),
+        order_by: [QbOrder { expr: QbCol("k"), descending: false,
+                             nulls: QbNullsDefault }],
+        limit: 10, offset: 5,
+        set_arms: [QbSetArm { op: QbIntersect, body: body_of("g-i") },
+                   QbSetArm { op: QbExcept, body: body_of("g-e2") }],
+        for_update: false })
+
+@test
+fn test_the_grammar_statement_walks_and_renders_in_one_order() [io]
+    let st = grammar_statement()
+
+    test.case("every clause, every arm, and the ten placeholders in order")
+    test.assert_eq_str(sql_of(st, QbPostgres),
+        "WITH RECURSIVE r (a, b) AS (SELECT * FROM u WHERE $1)" +
+        " SELECT DISTINCT ON ($2) u.*, 7 AS seven, 1 + 1 FROM r AS x" +
+        " CROSS JOIN o WHERE a + b AND (id IN (SELECT * FROM u WHERE $3)" +
+        " AND (count(DISTINCT k) FILTER (WHERE $4)" +
+        " AND CASE WHEN $5 THEN $6 ELSE $7 END))" +
+        " GROUP BY k HAVING $8 INTERSECT SELECT * FROM u WHERE $9" +
+        " EXCEPT SELECT * FROM u WHERE $10 ORDER BY k LIMIT 10 OFFSET 5")
+
+    test.case("and the parameter list carries each value where its text is")
+    test.assert_eq(list.len(params_of(st, QbPostgres)), 10)
+    test.assert(params_of(st, QbPostgres) == qbast.binds_of(st))
+    let ps = params_of(st, QbPostgres)
+    test.assert_eq(text_of(list.get(ps, 0)), "g-cte")
+    test.assert_eq(text_of(list.get(ps, 1)), "g-on")
+    test.assert_eq(text_of(list.get(ps, 2)), "g-in")
+    test.assert_eq(text_of(list.get(ps, 3)), "g-f")
+    test.assert_eq(text_of(list.get(ps, 4)), "g-w")
+    test.assert_eq(text_of(list.get(ps, 5)), "g-t")
+    test.assert_eq(text_of(list.get(ps, 6)), "g-e")
+    test.assert_eq(text_of(list.get(ps, 7)), "g-h")
+    test.assert_eq(text_of(list.get(ps, 8)), "g-i")
+    test.assert_eq(text_of(list.get(ps, 9)), "g-e2")
+
+    test.case("the walk sees the cte's table, the arm's, one raw and one level")
+    test.assert_eq(list.len(qbast.tables_of(st)), 2)
+    test.assert_eq(qbast.depth(st), 1)
+    test.assert_eq(qbast.raw_count(st), 1)
+
+    test.case("and the one clause sqlite cannot say is refused, with its path")
+    test.assert(refused(st, QbSqlite))
+    test.assert_eq_str(render_error(st, QbSqlite),
+                       "distinct_on: sqlite has no distinct-on")
+
+@test
+fn test_a_cte_reference_in_from_is_a_source_with_no_table_of_its_own() [io]
+    let st = QbStmtSelect(QbSelect {
+        ctes: [cte_of("r", [], body_of("x1"), false)],
+        distinct: false, distinct_on: [], columns: [item(QbStar, "")],
+        from: Some(QbCteRef("r", "x")),
+        joins: [QbJoin { kind: QbCross, source: QbTable("o", ""), on: None }],
+        where_: None, group_by: [], having: None, order_by: [], limit: -1,
+        offset: -1, set_arms: [], for_update: false })
+
+    test.case("the reference is written as a name with an alias, like a table")
+    test.assert_eq_str(sql_of(st, QbPostgres),
+        "WITH r AS (SELECT * FROM u WHERE $1)" +
+        " SELECT * FROM r AS x CROSS JOIN o")
+
+    test.case("but it contributes no table, and a cross join contributes no bind")
+    // Two tables, not three: `u` is the CTE body's and `o` is the
+    // join's, and `r` — which a walk that counted a reference as a
+    // table would add — is not one.
+    test.assert_eq(list.len(qbast.binds_of(st)), 1)
+    test.assert_eq(list.len(qbast.tables_of(st)), 2)
+    test.assert_eq(qbast.depth(st), 0)
+    test.assert(not qbrender.unguarded(st))
+
+// `IN (SELECT …)`, `NOT LIKE`, `ESCAPE` and `NOT ILIKE`.  The released
+// suites spell the first only negated, the next two only positively and
+// the last only for postgres — and the four branches the dialect words
+// are written in are the branches a mutation can move a word past.
+fn negated_statement() -> qbast.QbStmt
+    QbStmtSelect(QbSelect {
+        ctes: [], distinct: false, distinct_on: [],
+        columns: [item(QbStar, "")],
+        from: Some(QbTable("u", "")), joins: [],
+        where_: Some(QbAnd(
+            QbInSelect(QbCol("id"), body_of("n-in"), false),
+            QbAnd(QbLike(QbCol("nm"), QbBind(QbText("n-lk")), "", true),
+                  QbAnd(QbLike(QbCol("nm"), QbBind(QbText("n-es")),
+                               backslash(), true),
+                        QbILike(QbCol("nm"), QbBind(QbText("n-il")),
+                                true))))),
+        group_by: [], having: None, order_by: [], limit: -1, offset: -1,
+        set_arms: [], for_update: false })
+
+@test
+fn test_the_negated_arms_and_the_escape_clause() [io]
+    let st = negated_statement()
+
+    test.case("postgres writes IN, both NOT LIKEs and the ESCAPE between them")
+    test.assert_eq_str(sql_of(st, QbPostgres),
+        "SELECT * FROM u WHERE id IN (SELECT * FROM u WHERE $1)" +
+        " AND (nm NOT LIKE $2 AND (nm NOT LIKE $3 ESCAPE '" + backslash() +
+        "' AND nm NOT ILIKE $4))")
+    test.assert_eq(list.len(params_of(st, QbPostgres)), 3 + 1)
+    test.assert(params_of(st, QbPostgres) == qbast.binds_of(st))
+
+    test.case("and sqlite refuses the ILIKE, at the path where it sits")
+    test.assert(refused(st, QbSqlite))
+    test.assert_eq_str(render_error(st, QbSqlite),
+                       "where_.rhs.rhs.rhs: sqlite has no ilike")
+    test.assert_eq(list.len(faults_of(st, QbSqlite)), 1)
+
+    test.case("mysql and the engine take the same path, and the engine first")
+    test.assert(refused(st, QbMysql))
+    test.assert(refused(st, QbSqlEngine))
+    test.assert_eq(first_kind(st, QbSqlEngine), "unsupported")
+
+// ── The operator table, and the brackets around it ───────────────────
+
+@test
+fn test_every_binary_operator_is_spelled() [io]
+    let ops = [QbAdd, QbSub, QbMul, QbDiv, QbMod, QbConcat, QbBitAnd,
+               QbBitOr, QbShl, QbShr]
+    let words = ["+", "-", "*", "/", "%", "||", "&", "|", "<<", ">>"]
+    test.assert_eq(list.len(ops), 10)
+    test.assert_eq(list.len(words), 10)
+
+    test.case("one word per operator, with one space either side of it")
+    for i in 0..list.len(ops)
+        let word = list.get(words, i)
+        test.assert_eq_str(
+            expr_of(QbBinop(list.get(ops, i), QbCol("a"), QbCol("b")),
+                    QbSqlite),
+            "a " + word + " b")
+
+    test.case("mysql writes the concatenation as the call the others write ||")
+    test.assert_eq_str(expr_of(QbBinop(QbConcat, QbCol("a"), QbCol("b")),
+                               QbMysql),
+                       "CONCAT(a, b)")
+
+    test.case("and spells the arithmetic and the bitwise ones the same")
+    test.assert_eq_str(expr_of(QbBinop(QbAdd, QbCol("a"), QbCol("b")),
+                               QbMysql),
+                       "a + b")
+    test.assert_eq_str(expr_of(QbBinop(QbShr, QbCol("a"), QbCol("b")),
+                               QbSqlEngine),
+                       "a >> b")
+
+@test
+fn test_an_operator_operand_is_bracketed_and_a_comparison_operand_is_not() [io]
+    test.case("every operator used as an operand is bracketed")
+    test.assert_eq_str(
+        expr_of(QbNot(QbCmp(QbEq, QbCol("a"), QbLit(QbInt(1)))), QbSqlite),
+        "NOT (a = 1)")
+    test.assert_eq_str(
+        expr_of(QbBinop(QbAdd, QbCmp(QbEq, QbCol("a"), QbCol("b")), QbCol("c")),
+                QbSqlite),
+        "(a = b) + c")
+    test.assert_eq_str(
+        expr_of(QbBinop(QbAdd, QbAnd(QbCol("a"), QbCol("b")), QbCol("c")),
+                QbSqlite),
+        "(a AND b) + c")
+    test.assert_eq_str(
+        expr_of(QbBinop(QbMul, QbOr(QbCol("a"), QbCol("b")), QbCol("c")),
+                QbSqlite),
+        "(a OR b) * c")
+    test.assert_eq_str(expr_of(QbNot(QbNot(QbCol("a"))), QbSqlite),
+                       "NOT (NOT (a))")
+    test.assert_eq_str(
+        expr_of(QbBinop(QbMul, QbNot(QbCol("a")), QbCol("b")), QbSqlite),
+        "(NOT (a)) * b")
+
+    test.case("an AND of two comparisons needs none, which is the exception")
+    test.assert_eq_str(
+        expr_of(QbAnd(QbCmp(QbEq, QbCol("a"), QbLit(QbInt(1))), QbCol("b")),
+                QbSqlite),
+        "a = 1 AND b")
+    test.assert_eq_str(
+        expr_of(QbOr(QbNot(QbCol("a")), QbNot(QbCol("b"))), QbSqlite),
+        "NOT (a) OR NOT (b)")
+
+// ── The fold, and the two identities ─────────────────────────────────
+
+@test
+fn test_the_fold_identities_and_the_where_that_grows() [io]
+    let a = qbbuild.is_null("x")
+    let b = qbbuild.is_null("y")
+    let c = qbbuild.is_null("z")
+
+    test.case("or_where onto a select with no where yet is that condition")
+    test.assert_eq_str(
+        sql_of(QbStmtSelect(qbbuild.or_where(qbbuild.select(), a)), QbSqlite),
+        "SELECT * WHERE x IS NULL")
+
+    test.case("two or more fold left, which brackets the left pair")
+    test.assert_eq_str(
+        sql_of(QbStmtSelect(qbbuild.where_(qbbuild.select(),
+                                           qbbuild.all_of([a, b, c]))),
+               QbSqlite),
+        "SELECT * WHERE (x IS NULL AND y IS NULL) AND z IS NULL")
+    test.assert_eq_str(
+        sql_of(QbStmtSelect(qbbuild.where_(qbbuild.select(),
+                                           qbbuild.any_of([a, b, c]))),
+               QbSqlite),
+        "SELECT * WHERE (x IS NULL OR y IS NULL) OR z IS NULL")
+
+    test.case("one part is that part, not a wrapper around it")
+    test.assert_eq_str(
+        sql_of(QbStmtSelect(qbbuild.where_(qbbuild.select(),
+                                           qbbuild.all_of([a]))),
+               QbSqlite),
+        "SELECT * WHERE x IS NULL")
+
+    test.case("no parts is the identity, and the two are opposite")
+    test.assert_eq_str(
+        sql_of(QbStmtSelect(qbbuild.where_(qbbuild.select(),
+                                           qbbuild.all_of([]))),
+               QbSqlite),
+        "SELECT * WHERE 1")
+    test.assert_eq_str(
+        sql_of(QbStmtSelect(qbbuild.where_(qbbuild.select(),
+                                           qbbuild.any_of([]))),
+               QbSqlite),
+        "SELECT * WHERE 0")
+
+// ── The writers, the lengths and the fault split ─────────────────────
+
+@test
+fn test_the_page_shorthand_takes_a_hostile_number_as_read() [io]
+    // The two cases below are the ones a request supplies: a page number
+    // and a size.  Nothing here refuses a negative one — `-1` is how the
+    // struct spells "no limit", so a negative number is written as an
+    // absent clause — and the assertion says what the statement becomes
+    // rather than what it should have been, because this is the
+    // behaviour the release has.
+    test.case("a page and a size count from zero, one LIMIT and one OFFSET")
+    test.assert_eq_str(sql_of(QbStmtSelect(qbbuild.page(qbbuild.select(),
+                                                        2, 25)),
+                              QbPostgres),
+                       "SELECT * LIMIT 25 OFFSET 50")
+
+    test.case("a negative page number answers page zero's rows, with no OFFSET")
+    test.assert_eq_str(sql_of(QbStmtSelect(qbbuild.page(qbbuild.select(),
+                                                        -1, 25)),
+                              QbPostgres),
+                       "SELECT * LIMIT 25")
+
+    test.case("a negative size answers the whole table, with no LIMIT")
+    test.assert_eq_str(sql_of(QbStmtSelect(qbbuild.page(qbbuild.select(),
+                                                        1, -25)),
+                              QbPostgres),
+                       "SELECT *")
+
+    test.case("and zero is a number like any other, not an absent clause")
+    test.assert_eq_str(sql_of(QbStmtSelect(qbbuild.page(qbbuild.select(),
+                                                        0, 0)),
+                              QbPostgres),
+                       "SELECT * LIMIT 0 OFFSET 0")
+
+@test
+fn test_a_literal_written_for_a_dialect_that_cannot_quote_an_identifier() [io]
+    test.case("the engine has no quote character, and a value is still written")
+    test.assert_eq_str(literal_of(QbBool(true), QbSqlEngine), "1")
+    test.assert_eq_str(literal_of(QbText("o'brien"), QbSqlEngine),
+                       quote() + "o" + quote() + quote() + "brien" + quote())
+
+    test.case("while an identifier it cannot quote is refused, not written")
+    test.assert_eq_str(ident_of("we'ird", QbSqlEngine, false), "<refused>")
+
+    test.case("render_len is the render's count, plus the byte that ends it")
+    let st = delete_all_clauses()
+    test.assert_eq(render_len_of(st, qbrender.options(QbPostgres)),
+                   str.len(sql_of(st, QbPostgres)) + 1)
+    test.assert_eq(render_len_of(st, qbrender.options(QbSqlite)), 70)
+
+    test.case("and a render that refuses answers no length at all")
+    test.assert_eq(render_len_of(join_without_on(),
+                                 qbrender.options(QbSqlite)),
+                                 0)
+    test.assert_eq(render_len_of(join_without_on(),
+                                 qbrender.options(QbPostgres)),
+                                 0)
+
+@test
+fn test_the_error_method_and_the_free_message_are_one_sentence() [io]
+    test.case("a fault with a path: the path, then the sentence")
+    let f = qberror.fault(QbJoinWithoutOn, "joins[2].on")
+    test.assert_eq_str(f.message(), qberror.message(f))
+    test.assert_eq_str(f.message(),
+        "joins[2].on: a join other than a cross join needs an ON condition;" +
+        " QbCross is how a cross join is written")
+
+    test.case("and a fault about the statement as a whole carries no path")
+    let whole = qberror.fault(QbUpdateNothingSet, "")
+    test.assert_eq_str(whole.message(), "UPDATE sets no column")
+
+@test
+fn test_the_dialect_limits_are_three_kinds_and_the_rest_are_mistakes() [io]
+    let limits = [QbUnsupported(QbFeatReturning, QbMysql),
+                  QbUnquotableIdent("x", QbSqlEngine),
+                  QbSubqueryNeedsAlias]
+    let mistakes = [QbJoinWithoutOn, QbEmptyInList, QbCaseArity(1, 2),
+                    QbInsertArity(2, 1, 0), QbInsertNoColumns,
+                    QbInsertTwoSources, QbInsertNoSource,
+                    QbUpdateNothingSet, QbUnwritableIdent("x"),
+                    QbCteName("x"), QbSetArmOrdered, QbTooDeep(1),
+                    QbTooManyParams(1), QbWhereRequired, QbRawForbidden]
+
+    test.case("the three a port reads as the dialect's own limits")
+    for k in limits
+        test.assert(qberror.is_dialect_limit(qberror.fault(k, "")))
+
+    test.case("and the fifteen that are mistakes in the statement")
+    for k in mistakes
+        test.assert(not qberror.is_dialect_limit(qberror.fault(k, "")))
+
+    test.case("the split is what the two collectors filter on")
+    var all: [qberror.QbFault] = []
+    for k in limits
+        list.push(all, qberror.fault(k, ""))
+    for k in mistakes
+        list.push(all, qberror.fault(k, ""))
+    test.assert_eq(list.len(all), 18)
+    test.assert_eq(list.len(qberror.dialect_limits(all)), 3)
+    test.assert_eq(list.len(qberror.malformed(all)), 15)

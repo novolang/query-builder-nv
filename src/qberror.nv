@@ -1,7 +1,5 @@
 // qberror.nv — why a statement will not render.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // EVERY FAULT IS ABOUT THE STATEMENT, NEVER ABOUT THE DATABASE.  This
 // package does not connect to anything, so there is no "table not
 // found" here and no "constraint violated": everything below is
@@ -21,6 +19,7 @@
 // path into the statement in the spelling the AST uses, so a caller
 // reading a fault can find the expression in their own builder chain.
 
+use std.list
 use qbdialect
 
 // What is wrong.
@@ -81,6 +80,21 @@ pub enum QbFaultKind
     // and a query built out of a list the caller did not bound reaches
     // it as a runtime error from the server rather than here.
     QbTooManyParams(limit: Int)
+    // An `UPDATE` or `DELETE` with no `WHERE`, under
+    // `QbRenderOptions.require_where`.
+    //
+    // New in 0.1.0, and the reason it exists is that the switch that
+    // refuses an unguarded write had no kind to refuse it with:
+    // `require_where` was an option in the interface release with
+    // nothing in this enum to answer it.  It is a mistake in the
+    // statement only in the presence of the option — `unguarded` is
+    // the question, and by default the statement renders.
+    QbWhereRequired
+    // Spliced text in the statement, under
+    // `QbRenderOptions.forbid_raw`.  The second kind added in 0.1.0,
+    // for the same reason as the first: `forbid_raw` is a switch whose
+    // refusal had no name here.
+    QbRawForbidden
 
 // What is wrong, and where in the statement.
 pub struct QbFault
@@ -91,6 +105,44 @@ pub struct QbFault
     // for a fault about the statement as a whole.
     at: Str
 
+// ── The sentence ─────────────────────────────────────────────────────
+//
+// `impl Error for QbFault` and the free `message` are one text, which
+// is why they both come here rather than one of them holding it.
+
+// `joins[2].on: a join other than a cross join needs an ON condition`,
+// or the same without the path for a fault about the whole statement.
+fn sentence(f: QbFault) -> Str
+    let loc = if f.at == ""
+        ""
+    else
+        f.at + ": "
+    loc + clause(f.kind)
+
+// What is wrong, without the path.  Every dialect-specific fault names
+// its dialect here; the two switches name the option that refused,
+// because that is what the caller has to go and turn off.
+fn clause(kind: QbFaultKind) -> Str
+    match kind
+        QbJoinWithoutOn                     => "a join other than a cross join needs an ON condition; QbCross is how a cross join is written"
+        QbEmptyInList                       => "IN () has no values in it; guard the empty list or pick another condition"
+        QbCaseArity(whens, thens)           => "CASE has ${whens} WHEN branch(es) and ${thens} THEN branch(es)"
+        QbInsertArity(columns, values, row) => "INSERT row ${row} holds ${values} value(s) for ${columns} column(s)"
+        QbInsertNoColumns                   => "INSERT must name its columns; the table's declaration order is not visible here"
+        QbInsertTwoSources                  => "INSERT has both rows and a SELECT"
+        QbInsertNoSource                    => "INSERT has neither rows nor a SELECT"
+        QbUpdateNothingSet                  => "UPDATE sets no column"
+        QbUnquotableIdent(name, dialect)    => "${name} is not a bare identifier and ${qbdialect.name(dialect)} cannot quote one"
+        QbUnwritableIdent(name)             => "${name} holds a quote or a zero byte, which no dialect can write in an identifier"
+        QbUnsupported(feature, dialect)     => "${qbdialect.name(dialect)} has no ${qbdialect.feature_name(feature)}"
+        QbSubqueryNeedsAlias                => "a subquery in FROM needs an alias in this dialect"
+        QbCteName(name)                     => "${name} is not a usable CTE name; a CTE name is non-empty and used once"
+        QbSetArmOrdered                     => "a set operation's arm carries its own ORDER BY or LIMIT"
+        QbTooDeep(limit)                    => "the statement nests deeper than ${limit}"
+        QbTooManyParams(limit)              => "the statement binds more than ${limit} values"
+        QbWhereRequired                     => "an UPDATE or DELETE with no WHERE, and require_where is on"
+        QbRawForbidden                      => "the statement carries spliced text, and forbid_raw is on"
+
 // `QbFault` is an `Error`, which is what lets `Result<T, QbFault>`
 // exist at all — every fallible signature in `qbrender` answers with
 // one, from `render` and `render_str` through `render_len` to
@@ -100,9 +152,8 @@ impl Error for QbFault
     // named with the path into the statement it is about and, where
     // the fault has one, the dialect.
     //
-    // Panics with `not implemented` until the bodies land.
     fn message(self) -> Str
-        todo("query-builder-nv.QbFault.message")
+        sentence(self)
 
 // A fault, built.
 //
@@ -113,7 +164,7 @@ impl Error for QbFault
 //     println(qberror.fault(QbJoinWithoutOn, "joins[2].on").at)
 // ```
 pub fn fault(kind: QbFaultKind, at: Str) -> QbFault []
-    todo("query-builder-nv.qberror.fault")
+    QbFault { kind: kind, at: at }
 
 // The short name of a fault kind: `join-without-on`, `empty-in-list`,
 // `unsupported`.
@@ -125,7 +176,25 @@ pub fn fault(kind: QbFaultKind, at: Str) -> QbFault []
 //     println(qberror.kind_name(QbJoinWithoutOn))
 // ```
 pub fn kind_name(kind: QbFaultKind) -> Str []
-    todo("query-builder-nv.qberror.kind_name")
+    match kind
+        QbJoinWithoutOn                     => "join-without-on"
+        QbEmptyInList                       => "empty-in-list"
+        QbCaseArity(whens, thens)           => "case-arity"
+        QbInsertArity(columns, values, row) => "insert-arity"
+        QbInsertNoColumns                   => "insert-no-columns"
+        QbInsertTwoSources                  => "insert-two-sources"
+        QbInsertNoSource                    => "insert-no-source"
+        QbUpdateNothingSet                  => "update-nothing-set"
+        QbUnquotableIdent(name, dialect)    => "unquotable-ident"
+        QbUnwritableIdent(name)             => "unwritable-ident"
+        QbUnsupported(feature, dialect)     => "unsupported"
+        QbSubqueryNeedsAlias                => "subquery-needs-alias"
+        QbCteName(name)                     => "cte-name"
+        QbSetArmOrdered                     => "set-arm-ordered"
+        QbTooDeep(limit)                    => "too-deep"
+        QbTooManyParams(limit)              => "too-many-params"
+        QbWhereRequired                     => "where-required"
+        QbRawForbidden                      => "raw-forbidden"
 
 // One line a person can act on, naming the path and, where the fault
 // has one, the dialect.
@@ -137,7 +206,7 @@ pub fn kind_name(kind: QbFaultKind) -> Str []
 //     println(qberror.message(qberror.fault(QbJoinWithoutOn, "joins[2].on")))
 // ```
 pub fn message(f: QbFault) -> Str []
-    todo("query-builder-nv.qberror.message")
+    sentence(f)
 
 // True when the fault is a dialect's limitation rather than a mistake
 // in the statement — `QbUnsupported`, `QbUnquotableIdent` and
@@ -153,7 +222,25 @@ pub fn message(f: QbFault) -> Str []
 //     println("${qberror.is_dialect_limit(qberror.fault(QbJoinWithoutOn, ""))}")
 // ```
 pub fn is_dialect_limit(f: QbFault) -> Bool []
-    todo("query-builder-nv.qberror.is_dialect_limit")
+    match f.kind
+        QbUnsupported(feature, dialect)     => true
+        QbUnquotableIdent(name, dialect)    => true
+        QbSubqueryNeedsAlias                => true
+        QbJoinWithoutOn                     => false
+        QbEmptyInList                       => false
+        QbCaseArity(whens, thens)           => false
+        QbInsertArity(columns, values, row) => false
+        QbInsertNoColumns                   => false
+        QbInsertTwoSources                  => false
+        QbInsertNoSource                    => false
+        QbUpdateNothingSet                  => false
+        QbUnwritableIdent(name)             => false
+        QbCteName(name)                     => false
+        QbSetArmOrdered                     => false
+        QbTooDeep(limit)                    => false
+        QbTooManyParams(limit)              => false
+        QbWhereRequired                     => false
+        QbRawForbidden                      => false
 
 // The faults in `faults` that are dialect limitations, in order.
 //
@@ -165,7 +252,7 @@ pub fn is_dialect_limit(f: QbFault) -> Bool []
 //     println("${list.len(qberror.dialect_limits([]))}")
 // ```
 pub fn dialect_limits(faults: [QbFault]) -> [QbFault] []
-    todo("query-builder-nv.qberror.dialect_limits")
+    list.filter(faults, f => is_dialect_limit(f))
 
 // The faults in `faults` that are mistakes in the statement, in order.
 //
@@ -177,4 +264,4 @@ pub fn dialect_limits(faults: [QbFault]) -> [QbFault] []
 //     println("${list.len(qberror.malformed([]))}")
 // ```
 pub fn malformed(faults: [QbFault]) -> [QbFault] []
-    todo("query-builder-nv.qberror.malformed")
+    list.filter(faults, f => not is_dialect_limit(f))

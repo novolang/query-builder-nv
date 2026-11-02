@@ -1,8 +1,6 @@
 // qbdialect.nv — the four dialects, and the facts that differ between
 // them.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // A DIALECT IS A TABLE, NOT A BRANCH.  Every place the four disagree
 // is a function here answering one fact, and `qbrender` reads them.
 // The alternative — a `match d` at each of forty sites — is how a
@@ -13,9 +11,9 @@
 // THE FOUR, AND WHY THESE FOUR
 //
 //   QbSqlEngine   sql-engine-nv's, which is the dialect novodb and
-//                 pager-nv execute.  A SQLite subset with two gaps
+//                 pager-nv execute.  A SQLite subset with the gaps
 //                 this module reports: no quoted identifiers at all,
-//                 and no comment syntax.
+//                 no comment syntax, no placeholder token.
 //   QbSqlite      SQLite proper.
 //   QbPostgres    PostgreSQL.
 //   QbMysql       MySQL and MariaDB.
@@ -28,6 +26,15 @@
 // spelling.  A query builder that assumed it could always quote an
 // identifier would produce, for the sql-engine dialect, SQL that
 // lexes as two tokens where one was meant.
+//
+// A ROW IS A FEATURE AND A COLUMN IS A DIALECT, and the twelve rows the
+// README publishes stand exactly as published.  The rows it does not
+// name — the CTE, the recursive CTE, the upsert, `RIGHT JOIN`, the bare
+// `OFFSET` and the anonymous subquery — are read off sql-engine-nv's
+// own lexer and parser, which is where a dialect's facts come from.
+
+use std.list
+use std.str
 
 // Which SQL is being written.
 pub enum QbDialect
@@ -100,6 +107,91 @@ pub enum QbFeature
     // with a bind cannot be executed by it as written.  See the README.
     QbFeatParameters
 
+// ── The rows, and the word lists ─────────────────────────────────────
+//
+// Nothing below is public: the table is `supports`, and the lists are
+// the data it is made of.
+
+// The dialects that have `f` — one line per feature, which is the row a
+// reader comes here to check.  Read the other way, `supports(d, f)`
+// asks whether `d` is in the row, so the two readings are one table.
+fn dialects_with(f: QbFeature) -> [QbDialect]
+    match f
+        QbFeatQuotedIdent       => [QbSqlite, QbPostgres, QbMysql]
+        // Everything from here to `QbFeatComment` is a fact about the
+        // four engines rather than about one of them.
+        QbFeatCte               => dialects()
+        QbFeatRecursiveCte      => dialects()
+        QbFeatUpsert            => dialects()
+        QbFeatConflictTarget    => [QbSqlite, QbPostgres]
+        QbFeatReturning         => [QbSqlite, QbPostgres]
+        QbFeatILike             => [QbPostgres]
+        QbFeatDistinctOn        => [QbPostgres]
+        QbFeatFullJoin          => [QbSqlite, QbPostgres]
+        QbFeatRightJoin         => dialects()
+        QbFeatBooleanLiteral    => [QbPostgres]
+        QbFeatIsDistinctFrom    => [QbSqlite, QbPostgres, QbMysql]
+        QbFeatNullsOrdering     => [QbSqlite, QbPostgres]
+        QbFeatBareOffset        => [QbPostgres, QbMysql]
+        QbFeatForUpdate         => [QbPostgres, QbMysql]
+        QbFeatAnonymousSubquery => [QbSqlite]
+        QbFeatComment           => [QbSqlite, QbPostgres, QbMysql]
+        QbFeatParameters        => [QbSqlite, QbPostgres, QbMysql]
+
+// A byte a bare identifier may begin with: an ASCII letter, or `_`.
+fn ident_start(b: Int) -> Bool
+    b >= 65 and b <= 90 or b >= 97 and b <= 122 or b == 95
+
+// A byte a bare identifier may hold after its first: the above, or a
+// digit.
+fn ident_char(b: Int) -> Bool
+    ident_start(b) or b >= 48 and b <= 57
+
+// Whether every byte of `name` from `from` on is an identifier byte.
+//
+// Bytes rather than characters on purpose: a name with a letter outside
+// ASCII is not bare in any of the four, and reading bytes is what says
+// so without a Unicode table.
+fn ident_tail(name: Str, from: Int) -> Bool
+    var i = from
+    var ok = true
+    while ok and i < str.len(name)
+        ok = ident_char(str.byte_at(name, i) ?? 0)
+        i = i + 1
+    ok
+
+// The words reserved in all four.  Every one of them is in
+// sql-engine-nv's own list too — the one dialect where a word on this
+// list is REFUSED rather than quoted, so an over-wide list here would
+// refuse a column that engine accepts.
+fn common_reserved() -> [Str]
+    str.split("ALL AND AS ASC BETWEEN BY CASE CAST CHECK COLUMN CREATE DEFAULT DELETE DESC DISTINCT DROP ELSE END ESCAPE EXCEPT EXISTS FOREIGN FROM FULL GROUP HAVING IN INDEX INNER INSERT INTERSECT INTO IS JOIN KEY LEFT LIKE LIMIT NOT NULL OFFSET ON OR ORDER OUTER PRIMARY REFERENCES RIGHT SELECT SET TABLE THEN TO UNION UNIQUE UPDATE USING VALUES VIEW WHEN WHERE WITH",
+        " ")
+
+// The words each dialect reserves beyond the common ones, as one string
+// split on spaces: a word is added to a dialect's list by typing it
+// into the line, and no word is written twice because these are the
+// differences from `common_reserved` and not the whole list.
+fn dialect_reserved(d: QbDialect) -> [Str]
+    match d
+        QbSqlEngine => str.split("ABORT ABS ADD AFTER ALTER ANALYZE AUTOINCREMENT AVG BEFORE BEGIN BLOB CEIL CHAR COALESCE COMMIT CONFLICT COUNT DATE DATETIME DO DOUBLE EXP EXPLAIN FAIL FLOAT FLOOR GLOB GROUP_CONCAT HEX IF IFNULL IGNORE IIF INSTEAD INTEGER LENGTH LOG LOWER LTRIM MAX MEDIAN MIN MOD NOTHING NULLIF OVER POW PRAGMA REAL RECURSIVE RELEASE RENAME REPLACE RETURNING ROLLBACK ROUND SAVEPOINT SIGN SQRT STRFTIME SUBSTR SUM TEXT TIME TOTAL TRIGGER TRIM TYPEOF UPPER",
+            " ")
+        QbSqlite    => str.split("ABORT ACTION ADD AFTER ALTER ALWAYS ANALYZE ATTACH AUTOINCREMENT BEFORE BEGIN CASCADE COLLATE COMMIT CONFLICT CONSTRAINT CROSS CURRENT CURRENT_DATE CURRENT_TIME CURRENT_TIMESTAMP DATABASE DEFERRABLE DEFERRED DETACH DO EACH EXCLUDE EXCLUSIVE EXPLAIN FAIL FILTER FIRST FOLLOWING FOR GENERATED GLOB GROUPS IF IGNORE IMMEDIATE INDEXED INITIALLY INSTEAD ISNULL LAST MATCH MATERIALIZED NATURAL NO NOTHING NOTNULL NULLS OF OTHERS OVER PARTITION PLAN PRAGMA PRECEDING QUERY RAISE RANGE RECURSIVE REGEXP REINDEX RELEASE RENAME REPLACE RESTRICT RETURNING ROLLBACK ROW ROWS SAVEPOINT TEMP TEMPORARY TIES TRANSACTION TRIGGER UNBOUNDED VACUUM VIRTUAL WINDOW WITHOUT",
+            " ")
+        QbPostgres  => str.split("ANALYSE ANALYZE ANY ARRAY ASYMMETRIC AUTHORIZATION BINARY BOTH COLLATE COLLATION CONCURRENTLY CONSTRAINT CROSS CURRENT_CATALOG CURRENT_DATE CURRENT_ROLE CURRENT_SCHEMA CURRENT_TIME CURRENT_TIMESTAMP CURRENT_USER DEFERRABLE DO FALSE FETCH FOR FREEZE GRANT ILIKE INITIALLY ISNULL LATERAL LEADING LOCALTIME LOCALTIMESTAMP NATURAL NOTNULL ONLY OVERLAPS PLACING REAL RETURNING SESSION_USER SIMILAR SOME SYMMETRIC TABLESAMPLE TRAILING TRUE USER VARIADIC VERBOSE WINDOW",
+            " ")
+        QbMysql     => str.split("ACCESSIBLE ADD ALTER ANALYZE ASENSITIVE BEFORE BIGINT BINARY BLOB BOTH CALL CASCADE CHANGE CHAR CHARACTER COLLATE CONDITION CONSTRAINT CONTINUE CONVERT CROSS CUBE CUME_DIST CURRENT_DATE CURRENT_TIME CURRENT_TIMESTAMP CURRENT_USER CURSOR DATABASE DATABASES DAY_HOUR DAY_MICROSECOND DAY_MINUTE DAY_SECOND DEC DECIMAL DECLARE DELAYED DENSE_RANK DESCRIBE DETERMINISTIC DISTINCTROW DIV DOUBLE DUAL EACH ELSEIF EMPTY ENCLOSED ESCAPED EXIT EXPLAIN FALSE FETCH FIRST_VALUE FLOAT FLOAT4 FLOAT8 FOR FORCE FULLTEXT FUNCTION GENERATED GET GRANT GROUPING GROUPS HIGH_PRIORITY HOUR_MICROSECOND HOUR_MINUTE HOUR_SECOND IF IGNORE INFILE INOUT INSENSITIVE INT INT1 INT2 INT3 INT4 INT8 INTEGER INTERVAL IO_AFTER_GTIDS IO_BEFORE_GTIDS ITERATE JSON_TABLE KEYS KILL LAG LAST_VALUE LATERAL LEAD LEADING LEAVE LINEAR LINES LOAD LOCALTIME LOCALTIMESTAMP LOCK LONG LONGBLOB LONGTEXT LOOP LOW_PRIORITY MASTER_BIND MATCH MAXVALUE MEDIUMBLOB MEDIUMINT MEDIUMTEXT MIDDLEINT MINUTE_MICROSECOND MINUTE_SECOND MOD MODIFIES NATURAL NO_WRITE_TO_BINLOG NTH_VALUE NTILE NUMERIC OF OPTIMIZE OPTIMIZER_COSTS OPTION OPTIONALLY OUT OUTFILE OVER PARTITION PERCENT_RANK PRECISION PROCEDURE PURGE RANGE RANK READ READS READ_WRITE REAL RECURSIVE REGEXP RELEASE RENAME REPEAT REPLACE REQUIRE RESIGNAL RESTRICT RETURN REVOKE RLIKE ROW ROWS ROW_NUMBER SCHEMA SCHEMAS SECOND_MICROSECOND SENSITIVE SEPARATOR SHOW SIGNAL SMALLINT SPATIAL SPECIFIC SQL SQLEXCEPTION SQLSTATE SQLWARNING SQL_BIG_RESULT SQL_CALC_FOUND_ROWS SQL_SMALL_RESULT SSL STARTING STORED STRAIGHT_JOIN SYSTEM TERMINATED TINYBLOB TINYINT TINYTEXT TRAILING TRIGGER TRUE UNDO UNLOCK UNSIGNED USAGE USE UTC_DATE UTC_TIME UTC_TIMESTAMP VARBINARY VARCHAR VARCHARACTER VARYING VIRTUAL WHILE WINDOW WRITE XOR YEAR_MONTH ZEROFILL",
+            " ")
+
+// `$n`, counted from one.  A function of its own rather than a join on
+// the arm's line, because a `+` written inside a match arm is charged
+// to the function whether or not the arm runs — one cell, under the
+// leak checker — and the join here is the one place the placeholder's
+// number is written.  The package's `CHANGELOG.md` records it under
+// `### Known`.
+fn dollar(n: Int) -> Str
+    "$" + str.from_int(n + 1)
+
 // Whether `d` has `f`.
 //
 // Total over both enums, which is what makes the table a table.
@@ -111,7 +203,7 @@ pub enum QbFeature
 //     println("${qbdialect.supports(QbPostgres, QbFeatILike)}")
 // ```
 pub fn supports(d: QbDialect, f: QbFeature) -> Bool []
-    todo("query-builder-nv.qbdialect.supports")
+    list.contains(dialects_with(f), d)
 
 // The dialect's name, as it appears in a fault message: `sql-engine`,
 // `sqlite`, `postgres`, `mysql`.
@@ -123,7 +215,11 @@ pub fn supports(d: QbDialect, f: QbFeature) -> Bool []
 //     println(qbdialect.name(QbPostgres))
 // ```
 pub fn name(d: QbDialect) -> Str []
-    todo("query-builder-nv.qbdialect.name")
+    match d
+        QbSqlEngine => "sql-engine"
+        QbSqlite    => "sqlite"
+        QbPostgres  => "postgres"
+        QbMysql     => "mysql"
 
 // The short name of a feature, for a fault message and a report:
 // `quoted-ident`, `returning`, `distinct-on`.
@@ -135,7 +231,25 @@ pub fn name(d: QbDialect) -> Str []
 //     println(qbdialect.feature_name(QbFeatDistinctOn))
 // ```
 pub fn feature_name(f: QbFeature) -> Str []
-    todo("query-builder-nv.qbdialect.feature_name")
+    match f
+        QbFeatQuotedIdent       => "quoted-ident"
+        QbFeatCte               => "cte"
+        QbFeatRecursiveCte      => "recursive-cte"
+        QbFeatUpsert            => "upsert"
+        QbFeatConflictTarget    => "conflict-target"
+        QbFeatReturning         => "returning"
+        QbFeatILike             => "ilike"
+        QbFeatDistinctOn        => "distinct-on"
+        QbFeatFullJoin          => "full-join"
+        QbFeatRightJoin         => "right-join"
+        QbFeatBooleanLiteral    => "boolean-literal"
+        QbFeatIsDistinctFrom    => "is-distinct-from"
+        QbFeatNullsOrdering     => "nulls-ordering"
+        QbFeatBareOffset        => "bare-offset"
+        QbFeatForUpdate         => "for-update"
+        QbFeatAnonymousSubquery => "anonymous-subquery"
+        QbFeatComment           => "comment"
+        QbFeatParameters        => "parameters"
 
 // Every feature, so a caller can print the whole table or diff two
 // dialects.
@@ -148,7 +262,12 @@ pub fn feature_name(f: QbFeature) -> Str []
 //     println("${list.len(qbdialect.features())}")
 // ```
 pub fn features() -> [QbFeature] []
-    todo("query-builder-nv.qbdialect.features")
+    [QbFeatQuotedIdent, QbFeatCte, QbFeatRecursiveCte, QbFeatUpsert,
+     QbFeatConflictTarget, QbFeatReturning, QbFeatILike, QbFeatDistinctOn,
+     QbFeatFullJoin, QbFeatRightJoin, QbFeatBooleanLiteral,
+     QbFeatIsDistinctFrom, QbFeatNullsOrdering, QbFeatBareOffset,
+     QbFeatForUpdate, QbFeatAnonymousSubquery, QbFeatComment,
+     QbFeatParameters]
 
 // Every dialect.
 //
@@ -160,7 +279,7 @@ pub fn features() -> [QbFeature] []
 //     println("${list.len(qbdialect.dialects())}")
 // ```
 pub fn dialects() -> [QbDialect] []
-    todo("query-builder-nv.qbdialect.dialects")
+    [QbSqlEngine, QbSqlite, QbPostgres, QbMysql]
 
 // The placeholder for the `n`th bound parameter, counting from ZERO.
 //
@@ -176,7 +295,14 @@ pub fn dialects() -> [QbDialect] []
 //     println(qbdialect.placeholder(QbPostgres, 0))
 // ```
 pub fn placeholder(d: QbDialect, n: Int) -> Str []
-    todo("query-builder-nv.qbdialect.placeholder")
+    match d
+        QbSqlEngine => "?"
+        QbSqlite    => "?"
+        // The one arm where `n` is read: counted from zero here,
+        // written from one there, and this is the only place it
+        // happens.
+        QbPostgres  => dollar(n)
+        QbMysql     => "?"
 
 // The character an identifier is quoted with: `34` for `"`, `96` for a
 // backtick, and `0` for a dialect that cannot quote one.
@@ -188,7 +314,11 @@ pub fn placeholder(d: QbDialect, n: Int) -> Str []
 //     println("${qbdialect.quote_char(QbMysql)}")
 // ```
 pub fn quote_char(d: QbDialect) -> Int []
-    todo("query-builder-nv.qbdialect.quote_char")
+    match d
+        QbSqlEngine => 0
+        QbSqlite    => 34
+        QbPostgres  => 34
+        QbMysql     => 96
 
 // Whether `name` can be written unquoted in `d` — a leading letter or
 // underscore, then letters, digits and underscores, and not a reserved
@@ -205,7 +335,13 @@ pub fn quote_char(d: QbDialect) -> Int []
 //     println("${qbdialect.is_bare_ident(QbPostgres, "user_id")}")
 // ```
 pub fn is_bare_ident(d: QbDialect, name: Str) -> Bool []
-    todo("query-builder-nv.qbdialect.is_bare_ident")
+    if str.len(name) == 0
+        return false
+    if not ident_start(str.byte_at(name, 0) ?? 0)
+        return false
+    if not ident_tail(name, 1)
+        return false
+    not is_reserved(d, name)
 
 // Whether `word` is reserved in `d`, compared case-insensitively.
 //
@@ -221,7 +357,8 @@ pub fn is_bare_ident(d: QbDialect, name: Str) -> Bool []
 //     println("${qbdialect.is_reserved(QbPostgres, "user")}")
 // ```
 pub fn is_reserved(d: QbDialect, word: Str) -> Bool []
-    todo("query-builder-nv.qbdialect.is_reserved")
+    let upper = str.upper(word)
+    list.contains(common_reserved(), upper) or list.contains(dialect_reserved(d), upper)
 
 // The reserved words of `d`, upper case, in alphabetical order.
 //
@@ -236,7 +373,7 @@ pub fn is_reserved(d: QbDialect, word: Str) -> Bool []
 //     println("${list.len(qbdialect.reserved_words(QbSqlite))}")
 // ```
 pub fn reserved_words(d: QbDialect) -> [Str] []
-    todo("query-builder-nv.qbdialect.reserved_words")
+    list.sort(list.concat(common_reserved(), dialect_reserved(d)))
 
 // How `d` writes a boolean: `TRUE` / `FALSE` for PostgreSQL, `1` / `0`
 // for the rest.
@@ -248,7 +385,23 @@ pub fn reserved_words(d: QbDialect) -> [Str] []
 //     println(qbdialect.boolean_literal(QbSqlite, true))
 // ```
 pub fn boolean_literal(d: QbDialect, v: Bool) -> Str []
-    todo("query-builder-nv.qbdialect.boolean_literal")
+    match d
+        QbSqlEngine => if v
+            "1"
+        else
+            "0"
+        QbSqlite    => if v
+            "1"
+        else
+            "0"
+        QbPostgres  => if v
+            "TRUE"
+        else
+            "FALSE"
+        QbMysql     => if v
+            "1"
+        else
+            "0"
 
 // How `d` opens a blob literal — `X'` for three of them and `0x` for
 // MySQL — paired with `blob_suffix`.
@@ -260,7 +413,11 @@ pub fn boolean_literal(d: QbDialect, v: Bool) -> Str []
 //     println(qbdialect.blob_prefix(QbSqlite))
 // ```
 pub fn blob_prefix(d: QbDialect) -> Str []
-    todo("query-builder-nv.qbdialect.blob_prefix")
+    match d
+        QbSqlEngine => "X'"
+        QbSqlite    => "X'"
+        QbPostgres  => "X'"
+        QbMysql     => "0x"
 
 // How `d` closes a blob literal: `'` for three and empty for MySQL.
 //
@@ -271,7 +428,11 @@ pub fn blob_prefix(d: QbDialect) -> Str []
 //     println("[${qbdialect.blob_suffix(QbMysql)}]")
 // ```
 pub fn blob_suffix(d: QbDialect) -> Str []
-    todo("query-builder-nv.qbdialect.blob_suffix")
+    match d
+        QbSqlEngine => "'"
+        QbSqlite    => "'"
+        QbPostgres  => "'"
+        QbMysql     => ""
 
 // Whether a backslash inside a single-quoted string is an escape
 // character in `d`.
@@ -289,4 +450,4 @@ pub fn blob_suffix(d: QbDialect) -> Str []
 //     println("${qbdialect.backslash_escapes(QbMysql)}")
 // ```
 pub fn backslash_escapes(d: QbDialect) -> Bool []
-    todo("query-builder-nv.qbdialect.backslash_escapes")
+    d == QbMysql

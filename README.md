@@ -12,12 +12,6 @@ It executes nothing. The shape follows
 [sqlx](https://github.com/launchbadge/sqlx)'s `QueryBuilder` and
 [SQLAlchemy Core](https://docs.sqlalchemy.org/en/20/core/).
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is
-declared with its full signature, but every body is a `todo()` that
-panics when called. The package is published so its design can be
-reviewed and depended on before it is implemented. Version 0.1.0 will
-be the first working release.
-
 ## What it is
 
 A **statement** here is a tree. `qbbuild.select()` answers an empty
@@ -104,19 +98,16 @@ fn main() [io]
             println("${list.len(r.params)} parameters")
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test`
-fails on purpose: every test reaches a
-`not implemented: query-builder-nv.<module>.<fn>` panic. The tests are
-the specification the implementation will have to satisfy.
+Build and test with `novo pkg build` and `novo test`.
 
 ## What the package contains
 
 | Module | Contents |
 | --- | --- |
-| `qbast` | The whole statement vocabulary as one set of types, and the five questions a caller can ask of a statement without rendering it. |
+| `qbast` | The whole statement vocabulary as one set of types, and the six questions a caller can ask of a statement without rendering it. |
 | `qbbuild` | One call per fact added: the comparisons, the four statements, their clauses, and the two shorthands `page` and `count_of`. |
 | `qbrender` | The statement out as bytes with the values beside them, the options, the fault collector, and the two identifier and literal writers. |
-| `qbdialect` | The four dialects, the twenty features they differ over, and the table that answers which has which. |
+| `qbdialect` | The four dialects, the eighteen features they differ over, and the table that answers which has which. |
 | `qberror` | Why a statement will not render, and the split between a statement that is wrong everywhere and one this dialect cannot say. |
 
 The whole vocabulary is in one module because the tree is cyclic and
@@ -192,8 +183,10 @@ rendering it, for a program that logs, audits or routes queries.
     scope is the database's answer.
 11. **An identifier containing the dialect's own quote character, or a
     zero byte, is refused everywhere.** `QbUnwritableIdent`. Doubling
-    the quote is the correct escape and this package does it, but
-    there is no escape for a zero byte.
+    the quote is the SQL escape and the string-literal writer performs
+    it; the identifier writer refuses the name instead of trusting that
+    every reader of the statement shares the convention, and a zero
+    byte has no escape at all.
 12. **The sql-engine dialect cannot quote an identifier at all.** Its
     lexer recognises neither `"name"` nor a backtick, so an identifier
     is a run of ASCII letters, digits and underscores. A column named
@@ -218,8 +211,11 @@ rendering it, for a program that logs, audits or routes queries.
     see a server's version, so the SQLite row says the feature is
     present.
 
-These are the twelve differences that decide whether a statement can
-be rendered for a given dialect. `qbrender.unsupported` answers the
+These are the differences that decide whether a statement can be
+rendered for a given dialect, less the two this table does not list: an
+anonymous subquery in `FROM`, which only SQLite accepts without an
+alias, and an `OFFSET` with no `LIMIT`, which PostgreSQL and MySQL
+accept and SQLite needs rule 16 for. `qbrender.unsupported` answers the
 list for a statement.
 
 | Feature | sql-engine | SQLite | PostgreSQL | MySQL |
@@ -286,9 +282,10 @@ is written by hand, with `QbRaw` for the fragment that needs it.
 ## Tests
 
 ```bash
-novo test tests/qbbuild_tests.nv     # 15 tests: the builder chain and the refusals
-novo test tests/qbdialect_tests.nv   #  9 tests: the table, one fact at a time
-novo test tests/qbrender_tests.nv    # 20 tests: the bytes, and the values beside them
+novo test tests/qbbuild_tests.nv              # 15 tests: the builder chain and the refusals
+novo test tests/qbdialect_tests.nv            #  9 tests: the table, one fact at a time
+novo test tests/qbrender_tests.nv             # 20 tests: the bytes, and the values beside them
+novo test tests/query_builder_nv_edge_tests.nv # 36 tests: the value/syntax boundary
 ```
 
 The reference implementations are SeaQuery for the dialect table, sqlx
@@ -304,22 +301,13 @@ list is refused, that a `RETURNING` clause is reported as unsupported
 for MySQL rather than dropped, and that an identifier needing quotes
 is refused for the sql-engine dialect rather than written bare.
 
-The tests compile today and fail at run, each on the
-`not implemented: query-builder-nv.<module>.<fn>` panic that is its
-body. That is the expected state of an interface release. They turn
-green one at a time as bodies land.
-
-## Implementation status
-
-Nothing is implemented. Every function below is a `todo()`.
-
-| Module | Public surface |
-| --- | --- |
-| `qbast` | `target_table`, `is_write`, `tables_of`, `binds_of`, `raw_count`, `depth` |
-| `qbbuild` | The five value constructors; `eq`, `ne`, `lt`, `gt`, `le`, `ge`, `in_values`, `like`, `escape_like`, `is_null`, `is_not_null`, `between`, `all_of`, `any_of`; `select`, `from`, `from_select`, `column`, `column_as`, `columns`, `distinct`, `where_`, `and_where`, `or_where`, `join`, `group_by`, `and_having`, `order_by`, `order_by_nulls`, `limit`, `offset`, `with_cte`, `union`; `insert`, `values`, `insert_select`, `on_conflict_ignore`, `on_conflict_update`, `insert_returning`; `assign`, `assign_expr`, `update`, `set`, `update_where`, `update_returning`; `delete`, `delete_where`, `delete_returning`; `page`, `count_of` |
-| `qbrender` | `options`, `with_pretty`, `with_require_where`, `with_forbid_raw`, `render`, `render_str`, `render_expr`, `check`, `unsupported`, `unguarded`, `render_len`, `write_ident`, `write_literal`, `raw_sites`, `cannot_build` |
-| `qbdialect` | `supports`, `name`, `feature_name`, `features`, `dialects`, `placeholder`, `quote_char`, `is_bare_ident`, `is_reserved`, `reserved_words`, `boolean_literal`, `blob_prefix`, `blob_suffix`, `backslash_escapes` |
-| `qberror` | `fault`, `kind_name`, `message`, `is_dialect_limit`, `dialect_limits`, `malformed` |
+`tests/query_builder_nv_edge_tests.nv` is the boundary suite added
+with the bodies. Its first cases render the same statement twice, once
+with a hostile value and once with a harmless one, and assert the two
+are byte-identical with the value found whole in the parameter list —
+so they fail if the renderer ever puts a value into the text instead
+of beside it. The rest of it pins the clause order, the placeholder
+numbering, the zero byte that ends a buffer, and every fault kind.
 
 ## Licence
 

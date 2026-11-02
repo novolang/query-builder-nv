@@ -1,8 +1,6 @@
 // qbrender.nv — the statement out as bytes, with the parameters
 // beside them.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // NOTHING HERE WRITES.  Every function takes the buffer to append to
 // and answers it back, so a caller building a batch of statements
 // keeps one buffer and a test asserts on bytes with no database in the
@@ -28,6 +26,19 @@
 // EVERY DIALECT DIFFERENCE IS A `qbdialect` CALL.  There is no `match
 // d` in this module's design beyond what the table cannot express;
 // see that module's head comment for why.
+//
+// THE BYTES END WITH A ZERO.  `render`, `render_expr` and
+// `write_literal` append one zero byte after the statement, because
+// the `Str` they are usually turned into is NUL-terminated and the
+// drivers take one; `render_str` strips it again rather than letting
+// it ride into the `sql` a caller prints.  `write_ident` does not,
+// because the statement walk calls it in the middle of a statement.
+// `render_len` counts the byte, so its answer is `list.len` of what
+// `render` appends.
+
+use std.bytes
+use std.list
+use std.str
 
 use qbast
 use qbdialect
@@ -74,6 +85,1075 @@ pub struct QbRender
     // limit.
     params: [qbast.QbValue]
 
+// ── The walk, and the bytes it makes ─────────────────────────────────
+//
+// ONE `Emit` BETWEEN TWENTY FUNCTIONS.  The buffer, the parameter
+// list, the faults, the next placeholder, the depth and the options
+// travel in one struct that every function in this section is handed
+// as its first parameter, so each one only has to say what to write
+// and where in the statement it is.  The order of the calls below is
+// the order of the bytes, and the order of the bytes is the order of
+// the placeholders — which is the invariant the whole package rests
+// on, and the reason there is no second traversal to drift from this
+// one.
+//
+// A FAULT IS RECORDED TWICE OVER.  Every fault goes into `faults`, in
+// the order the walk met it, which is what `check` answers; the ones a
+// render refuses on also go into `stops`, and `render` answers the
+// first of those.  The two lists differ for the dialect limits that
+// have a correct spelling anyway — `TRUE` is written `1` in SQLite and
+// reported, not refused — so the distinction lives in `refuses` alone.
+
+// A path into the statement, in the AST's spelling: `joins[0].on`,
+// `columns[2].expr`.  Its own function rather than an inline join,
+// because a `+` written inside a match arm strands a cell whether or
+// not the arm runs — `language/a-join-in-a-match-arm-is-leaked-even-
+// when-the-arm-is-not-taken`, fixed in 0.20.3, still live in the
+// 0.20.2 toolchain this package is verified against — and every path
+// here is built inside an arm.
+fn indexed(base: Str, i: Int) -> Str
+    base + "[" + str.from_int(i) + "]"
+
+// A field of the thing at `base`: `joins[0].on`, or `on` at the top
+// level, because the statement has no name.
+fn field(base: Str, name: Str) -> Str
+    if base == ""
+        name
+    else
+        base + "." + name
+
+// What the walk carries: the bytes so far, the values so far, what it
+// has refused, what it has only noticed, and where it is.
+struct Emit
+    // The bytes, when writing.
+    var bytes: [u8]
+    // How many bytes there are, whether writing them or only counting.
+    var count: Int
+    // The values, in placeholder order.
+    var params: [qbast.QbValue]
+    // Every fault, in the order the walk met it.  What `check` answers.
+    var faults: [qberror.QbFault]
+    // The faults a render refuses on.  What `render` answers the first
+    // of.
+    var stops: [qberror.QbFault]
+    // The position the next placeholder gets, counted from zero.
+    var next_param: Int
+    // How many subqueries deep the walk is.
+    var depth: Int
+    // Count bytes and append none.  `render_len` sets it.
+    counting: Bool
+    // What the caller allowed.
+    o: QbRenderOptions
+
+// The state a walk starts in.  `first_param` is where the numbering
+// starts, which is what `render_expr` is for.
+fn emitter(o: QbRenderOptions, counting: Bool, first_param: Int) -> Emit
+    Emit { bytes: [], count: 0, params: [], faults: [], stops: [],
+           next_param: first_param, depth: 0, counting: counting, o: o }
+
+// The options for a dialect with nothing changed: the defaults every
+// published call starts from.
+fn plain_options(d: qbdialect.QbDialect) -> QbRenderOptions
+    QbRenderOptions { dialect: d, pretty: false, quote_all: false,
+                      require_where: false, forbid_raw: false,
+                      max_depth: 64, max_params: 65535 }
+
+// The zero byte a rendered statement ends with.  One function so that
+// `render` appends it and `render_len` counts it by the same
+// definition, and `render_str` strips exactly what they agree on.
+fn terminator() -> [u8]
+    [0 as u8]
+
+// One byte: counted either way, appended when writing.
+fn emit_byte(var st: Emit, b: Int)
+    st.count = st.count + 1
+    if not st.counting
+        list.push(st.bytes, b as u8)
+
+// A whole `Str`, byte by byte.  Not `bytes.from_str`: the counting
+// pass would then have to build the buffer it is counting.
+fn emit_text(var st: Emit, s: Str)
+    var i = 0
+    while i < str.len(s)
+        emit_byte(var st, str.byte_at_or(s, i, 0))
+        i = i + 1
+
+// An `Int` written as digits.
+fn emit_int(var st: Emit, n: Int)
+    emit_text(var st, str.from_int(n))
+
+// The space between two clauses: one space in the flat form, a newline
+// and an indent in the pretty one.  Every clause boundary goes through
+// here, and nowhere else, so the two forms cannot disagree about
+// anything but the whitespace.
+fn gap(var st: Emit)
+    if st.o.pretty
+        emit_byte(var st, 10)
+        emit_byte(var st, 32)
+        emit_byte(var st, 32)
+    else
+        emit_byte(var st, 32)
+
+// A fault, into both lists: always into `faults`, and into `stops`
+// when a render refuses on it.
+fn record(var st: Emit, kind: qberror.QbFaultKind, at: Str)
+    let f = qberror.fault(kind, at)
+    list.push(st.faults, f)
+    if refuses(kind)
+        list.push(st.stops, f)
+
+// Whether the render refuses on this kind rather than writing past it.
+// A statement that is malformed is refused everywhere; a dialect limit
+// is refused when there is no spelling for it at all, and only
+// reported when the dialect writes something equivalent instead.
+fn refuses(k: qberror.QbFaultKind) -> Bool
+    match k
+        QbUnsupported(feature, dialect)     => feature_refuses(feature)
+        QbUnquotableIdent(name, dialect)    => true
+        QbUnwritableIdent(name)             => true
+        QbSubqueryNeedsAlias                => true
+        QbJoinWithoutOn                     => true
+        QbEmptyInList                       => true
+        QbCaseArity(whens, thens)           => true
+        QbInsertArity(columns, values, row) => true
+        QbInsertNoColumns                   => true
+        QbInsertTwoSources                  => true
+        QbInsertNoSource                    => true
+        QbUpdateNothingSet                  => true
+        QbCteName(name)                     => true
+        QbSetArmOrdered                     => true
+        QbTooDeep(limit)                    => true
+        QbTooManyParams(limit)              => true
+        QbWhereRequired                     => true
+        QbRawForbidden                      => true
+
+// Whether a dialect's not having this feature stops the render.  The
+// ones it does not are the ones the dialect can write some other way:
+// a boolean literal is `1`, a conflict target is dropped because MySQL
+// uses whichever unique index was hit, an offset needs a `LIMIT -1`
+// in front of it.  Those are still REPORTED — a port wants to see
+// them — and they are not refusals.
+//
+// Seven of the eighteen arms cannot be reached and are marked below.
+// A feature no dialect lacks is never reported at all, because `note`
+// asks `qbdialect.supports` first and answers before it records; and
+// the two arms that say quoting stops the render are pre-empted, since
+// the one dialect that cannot quote reports a kind of its own
+// (`QbUnquotableIdent`, `QbSubqueryNeedsAlias`) rather than
+// `QbUnsupported`.  The arms are kept because the match is the table a
+// nineteenth feature would have to be classified in, and a wildcard
+// would let one through unclassified.
+fn feature_refuses(f: qbdialect.QbFeature) -> Bool
+    match f
+        QbFeatReturning         => true
+        QbFeatILike             => true
+        QbFeatDistinctOn        => true
+        QbFeatNullsOrdering     => true
+        QbFeatFullJoin          => true
+        QbFeatForUpdate         => true
+        QbFeatParameters        => true
+        // cov: skip — reported as QbUnquotableIdent instead
+        QbFeatQuotedIdent       => true
+        // cov: skip — reported as QbSubqueryNeedsAlias instead
+        QbFeatAnonymousSubquery => true
+        QbFeatConflictTarget    => false
+        QbFeatBooleanLiteral    => false
+        // cov: skip — supported by all four dialects
+        QbFeatComment           => false
+        // cov: skip — supported by all four dialects
+        QbFeatCte               => false
+        // cov: skip — supported by all four dialects
+        QbFeatRecursiveCte      => false
+        // cov: skip — supported by all four dialects
+        QbFeatUpsert            => false
+        // cov: skip — supported by all four dialects
+        QbFeatRightJoin         => false
+        QbFeatIsDistinctFrom    => false
+        QbFeatBareOffset        => false
+
+// Note a feature the statement uses, if this dialect has not got it.
+// Called at the point the feature is written, so the fault's path is
+// the clause a caller has to change.
+fn note(var st: Emit, f: qbdialect.QbFeature, at: Str)
+    if not qbdialect.supports(st.o.dialect, f)
+        record(var st, QbUnsupported(f, st.o.dialect), at)
+
+// One level deeper, and the ceiling checked on the way in.  Recorded
+// once, at the level that broke it, rather than once per level below.
+fn enter(var st: Emit)
+    st.depth = st.depth + 1
+    if st.depth == st.o.max_depth + 1
+        record(var st, QbTooDeep(st.o.max_depth), "")
+
+fn leave(var st: Emit)
+    st.depth = st.depth - 1
+
+// `bs` appended to `out`, answered.  `list.concat` rather than
+// `list.push`, because the buffer arrives as a borrowed parameter and a
+// writable name cannot be made from one ([E2038]); the answer is the
+// list a caller keeps, which is what every signature here means by
+// taking the buffer and answering it.
+fn append_into(out: [u8], bs: [u8]) -> [u8]
+    list.concat(out, bs)
+
+// `bs` and the terminating zero, appended to `out`, answered.
+fn append_terminated(out: [u8], bs: [u8]) -> [u8]
+    let with_body = append_into(out, bs)
+    append_into(with_body, terminator())
+
+// How a render ends: the first fault it refuses on, or the buffer with
+// the statement and its terminator on the end of it.  A refused render
+// appends NOTHING to the caller's buffer — the bytes were built
+// privately and are dropped — so a caller that ignores the `Err` does
+// not find half a statement in their batch.
+fn finished(st: Emit, out: [u8]) -> Result<QbRender, qberror.QbFault>
+    if list.len(st.stops) > 0
+        Err(list.get(st.stops, 0))
+    else
+        Ok(QbRender { text: append_terminated(out, st.bytes), params: st.params })
+
+// ── Identifiers and literals ─────────────────────────────────────────
+//
+// THE TWO PLACES A VALUE COULD BECOME SYNTAX, and the only two.  An
+// identifier is written as an identifier and a value is written as a
+// value, and nothing a caller put in either is parsed as anything
+// else: that is the claim this package exists to make, and it is made
+// by these two functions rather than by the forty that call them.
+
+// Whether `name` is reserved in any of the four dialects.  A name this
+// package would quote for one of them is a name whose meaning depends
+// on the dialect, which is the fact `write_ident` needs about a
+// dialect that cannot quote at all.
+fn reserved_somewhere(name: Str) -> Bool
+    var found = false
+    for d in qbdialect.dialects()
+        if qbdialect.is_reserved(d, name)
+            found = true
+    found
+
+// Whether `name` has to be quoted for `d`.  A name that is not a bare
+// identifier there needs quotes; and for a dialect with no quoting at
+// all, so does a name another dialect reserves — there is no spelling
+// of `user` that survives the trip, so the answer is a fault rather
+// than a statement that works on one engine and not the next.
+fn needs_quotes(d: qbdialect.QbDialect, name: Str) -> Bool
+    if qbdialect.is_bare_ident(d, name)
+        qbdialect.quote_char(d) == 0 and reserved_somewhere(name)
+    else
+        true
+
+// Whether `name` can be written at all: non-empty and holding neither
+// the dialect's own quote character nor a zero byte.  A quote inside
+// quotes would need doubling, which this package refuses to guess at
+// because the dialect's escape is not the one every reader assumes,
+// and a zero byte ends the string somewhere downstream.
+fn writable_name(d: qbdialect.QbDialect, name: Str) -> Bool
+    if str.len(name) == 0
+        false
+    else
+        var ok = true
+        var i = 0
+        while i < str.len(name)
+            let b = str.byte_at_or(name, i, 0)
+            if b == 0 or b == qbdialect.quote_char(d)
+                ok = false
+            i = i + 1
+        ok
+
+// What is wrong with writing `name` for `d`, or `None` when it is
+// writable.  One function so that the public `write_ident` and the
+// statement walk answer the same fault for the same name, with only
+// the path differing.
+fn ident_kind(name: Str, d: qbdialect.QbDialect, always: Bool) -> ?qberror.QbFaultKind
+    if not writable_name(d, name)
+        Some(QbUnwritableIdent(name))
+    else if always or needs_quotes(d, name)
+        if qbdialect.quote_char(d) == 0
+            Some(QbUnquotableIdent(name, d))
+        else
+            None
+    else
+        None
+
+// An identifier's bytes.  The caller has already established that they
+// are writable; this only decides whether the quotes go around them.
+fn emit_ident_bytes(var st: Emit, name: Str, d: qbdialect.QbDialect, always: Bool)
+    if always or needs_quotes(d, name)
+        emit_byte(var st, qbdialect.quote_char(d))
+        emit_text(var st, name)
+        emit_byte(var st, qbdialect.quote_char(d))
+    else
+        emit_text(var st, name)
+
+// One identifier into the statement, at `at`, or the fault that stops
+// the render.  Every column, alias, table and CTE name in this module
+// goes through here.
+fn emit_ident(var st: Emit, name: Str, always: Bool, at: Str)
+    match ident_kind(name, st.o.dialect, always)
+        Some(k) => record(var st, k, at)
+        None    => emit_ident_bytes(var st, name, st.o.dialect, always)
+
+// A doubled single quote: the escape for a quote inside a SQL string
+// in all four dialects, and the reason a value cannot end the string
+// it is written in.
+fn emit_quote_escape(var st: Emit)
+    emit_text(var st, "''")
+
+// A doubled backslash: what MySQL needs inside a string — with
+// `NO_BACKSLASH_ESCAPES` off, which is the default and which this
+// package cannot see — and what the other three must not be given,
+// because for them a backslash is a byte like any other.
+fn emit_backslash_escape(var st: Emit)
+    emit_byte(var st, 92)
+    emit_byte(var st, 92)
+
+// A `Str` as a SQL string literal, escaped for the dialect.  Written
+// byte by byte: a `Str` may hold any byte but a zero, and none of them
+// is special to the writer — which is the whole claim.
+fn emit_text_literal(var st: Emit, s: Str)
+    emit_byte(var st, 39)
+    var i = 0
+    while i < str.len(s)
+        let b = str.byte_at_or(s, i, 0)
+        if b == 39
+            emit_quote_escape(var st)
+        else if b == 92 and qbdialect.backslash_escapes(st.o.dialect)
+            emit_backslash_escape(var st)
+        else
+            emit_byte(var st, b)
+        i = i + 1
+    emit_byte(var st, 39)
+
+// Bytes as the dialect's blob literal: `X'4142'` for three of them and
+// `0x4142` for MySQL.  Hex, so no byte in the payload needs an escape.
+fn emit_blob(var st: Emit, bs: [u8])
+    emit_text(var st, qbdialect.blob_prefix(st.o.dialect))
+    emit_text(var st, bytes.to_hex(bytes.from_byte_list(bs)))
+    emit_text(var st, qbdialect.blob_suffix(st.o.dialect))
+
+// One value written into the SQL text.  `QbLit` comes through here,
+// and so does the public `write_literal`.
+fn emit_lit_value(var st: Emit, v: qbast.QbValue, at: Str)
+    match v
+        QbNull     => emit_text(var st, "NULL")
+        QbInt(n)   => emit_int(var st, n)
+        QbFloat(x) => emit_text(var st, str.from_float(x))
+        QbBool(b)  =>
+            note(var st, QbFeatBooleanLiteral, at)
+            emit_text(var st, qbdialect.boolean_literal(st.o.dialect, b))
+        QbText(s)  => emit_text_literal(var st, s)
+        QbBlob(bs) => emit_blob(var st, bs)
+
+// One bound value: the dialect's placeholder for the position it
+// landed in, then the value itself into the parameter list.  The two
+// are written by these six lines and by nothing else, which is why
+// they cannot get out of step.
+fn emit_bind(var st: Emit, v: qbast.QbValue, at: Str)
+    note(var st, QbFeatParameters, at)
+    if list.len(st.params) == st.o.max_params
+        record(var st, QbTooManyParams(st.o.max_params), "")
+    emit_text(var st, qbdialect.placeholder(st.o.dialect, st.next_param))
+    st.next_param = st.next_param + 1
+    list.push(st.params, v)
+
+// ── Expressions ──────────────────────────────────────────────────────
+//
+// PRECEDENCE IS HANDLED BY PARENTHESISING, NOT BY KNOWING IT.  An
+// operand that is itself an operator is wrapped, so `a = b AND c = d`
+// keeps its meaning wherever it is spliced in, and the wrapping rules
+// are the two functions below rather than a table of levels nobody can
+// check.  The two exceptions are the ones the assertions in the
+// shipped suite pin: an `AND`/`OR` operand is NOT wrapped when it is a
+// comparison, and a comparison operands' `AND`/`OR` IS wrapped.
+
+// Whether `e` is an operator, and so needs brackets wherever it is an
+// operand.
+fn is_operator(e: qbast.QbExpr) -> Bool
+    match e
+        QbCmp(op, lhs, rhs)   => true
+        QbBinop(op, lhs, rhs) => true
+        QbAnd(lhs, rhs)       => true
+        QbOr(lhs, rhs)        => true
+        QbNot(operand)        => true
+        _                     => false
+
+// Whether `e` is a boolean connective — the one thing an `AND`/`OR`
+// operand needs brackets for, because `a AND b AND c` groups either
+// way and `a OR b AND c` does not.
+fn is_connective(e: qbast.QbExpr) -> Bool
+    match e
+        QbAnd(lhs, rhs) => true
+        QbOr(lhs, rhs)  => true
+        _               => false
+
+// An operand of a comparison or an arithmetic operator: bracketed when
+// it is an operator of its own.
+fn emit_operand(var st: Emit, e: qbast.QbExpr, at: Str)
+    if is_operator(e)
+        emit_text(var st, "(")
+        emit_expr(var st, e, at)
+        emit_text(var st, ")")
+    else
+        emit_expr(var st, e, at)
+
+// An operand of `AND` or `OR`.
+fn emit_connective_operand(var st: Emit, e: qbast.QbExpr, at: Str)
+    if is_connective(e)
+        emit_text(var st, "(")
+        emit_expr(var st, e, at)
+        emit_text(var st, ")")
+    else
+        emit_expr(var st, e, at)
+
+// The comparison operator's spelling.  `QbDistinct` never reaches
+// here: MySQL writes it as an inverted `<=>` and the branch that does
+// is in `emit_cmp`.
+fn emit_cmp_word(var st: Emit, op: qbast.QbCmpOp)
+    match op
+        QbEq       => emit_text(var st, "=")
+        QbNe       => emit_text(var st, "<>")
+        QbLt       => emit_text(var st, "<")
+        QbLe       => emit_text(var st, "<=")
+        QbGt       => emit_text(var st, ">")
+        QbGe       => emit_text(var st, ">=")
+        QbDistinct => emit_text(var st, "IS DISTINCT FROM")
+
+// A comparison.  MySQL has no `IS DISTINCT FROM` and spells the same
+// question `a <=> b` with the opposite sense, so the render writes
+// `NOT (a <=> b)` and reports the translation under `QbFeatIsDistinctFrom`
+// for a caller who wants to see it happen.
+fn emit_cmp(var st: Emit, op: qbast.QbCmpOp, lhs: qbast.QbExpr, rhs: qbast.QbExpr, at: Str)
+    if op == qbast.QbDistinct and st.o.dialect == QbMysql
+        // `record`, not `note`: MySQL HAS the feature — the table says
+        // so, because `<=>` asks the same question — and what a caller
+        // has to see is that a translation happened, which is exactly
+        // what the row is for.
+        record(var st, QbUnsupported(QbFeatIsDistinctFrom, st.o.dialect), at)
+        emit_text(var st, "NOT (")
+        emit_operand(var st, lhs, field(at, "lhs"))
+        emit_text(var st, " <=> ")
+        emit_operand(var st, rhs, field(at, "rhs"))
+        emit_text(var st, ")")
+    else
+        emit_operand(var st, lhs, field(at, "lhs"))
+        emit_text(var st, " ")
+        emit_cmp_word(var st, op)
+        emit_text(var st, " ")
+        emit_operand(var st, rhs, field(at, "rhs"))
+
+// The arithmetic and bitwise operator's spelling, and `||` for a
+// concatenation.  MySQL's `CONCAT(a, b)` is a call rather than an
+// operator and lives in the branch in `emit_binop`.
+fn emit_binop_word(var st: Emit, op: qbast.QbBinOp)
+    match op
+        QbAdd    => emit_text(var st, "+")
+        QbSub    => emit_text(var st, "-")
+        QbMul    => emit_text(var st, "*")
+        QbDiv    => emit_text(var st, "/")
+        QbMod    => emit_text(var st, "%")
+        QbConcat => emit_text(var st, "||")
+        QbBitAnd => emit_text(var st, "&")
+        QbBitOr  => emit_text(var st, "|")
+        QbShl    => emit_text(var st, "<<")
+        QbShr    => emit_text(var st, ">>")
+
+// An arithmetic, bitwise or concatenating operation.  MySQL needs
+// `CONCAT(a, b)` for a `||` unless the server was started with
+// `PIPES_AS_CONCAT`, which this package cannot see.
+fn emit_binop(var st: Emit, op: qbast.QbBinOp, lhs: qbast.QbExpr, rhs: qbast.QbExpr, at: Str)
+    if op == qbast.QbConcat and st.o.dialect == QbMysql
+        emit_text(var st, "CONCAT(")
+        emit_operand(var st, lhs, field(at, "lhs"))
+        emit_text(var st, ", ")
+        emit_operand(var st, rhs, field(at, "rhs"))
+        emit_text(var st, ")")
+    else
+        emit_operand(var st, lhs, field(at, "lhs"))
+        emit_text(var st, " ")
+        emit_binop_word(var st, op)
+        emit_text(var st, " ")
+        emit_operand(var st, rhs, field(at, "rhs"))
+
+// Expressions separated by commas, each at its own index: the items of
+// a `SELECT`, a function's arguments, a `GROUP BY` list.
+fn emit_exprs(var st: Emit, es: [qbast.QbExpr], base: Str)
+    var i = 0
+    for e in es
+        if i > 0
+            emit_text(var st, ", ")
+        emit_expr(var st, e, indexed(base, i))
+        i = i + 1
+
+// `IN (...)`, `NOT IN (...)`.
+fn emit_in(var st: Emit, operand: qbast.QbExpr, values: [qbast.QbExpr], negated: Bool, at: Str)
+    if list.len(values) == 0
+        record(var st, QbEmptyInList, at)
+    emit_operand(var st, operand, field(at, "operand"))
+    if negated
+        emit_text(var st, " NOT IN (")
+    else
+        emit_text(var st, " IN (")
+    emit_exprs(var st, values, field(at, "values"))
+    emit_text(var st, ")")
+
+// `CASE WHEN a THEN b … ELSE c END`.  The branches are interleaved and
+// the shorter list stops the loop, so a `QbCase` whose halves disagree
+// is refused and still cannot crash the render.
+fn emit_case(var st: Emit, whens: [qbast.QbExpr], thens: [qbast.QbExpr], otherwise: ?qbast.QbExpr,
+             at: Str)
+    if list.len(whens) != list.len(thens)
+        record(var st, QbCaseArity(list.len(whens), list.len(thens)), at)
+    emit_text(var st, "CASE")
+    var i = 0
+    while i < list.len(whens) and i < list.len(thens)
+        emit_text(var st, " WHEN ")
+        emit_expr(var st, list.get(whens, i), indexed(field(at, "whens"), i))
+        emit_text(var st, " THEN ")
+        emit_expr(var st, list.get(thens, i), indexed(field(at, "thens"), i))
+        i = i + 1
+    match otherwise
+        Some(alt) =>
+            emit_text(var st, " ELSE ")
+            emit_expr(var st, alt, field(at, "otherwise"))
+        None      => ()
+    emit_text(var st, " END")
+
+// A subquery in brackets, one level deeper, with the depth ceiling
+// checked on the way in.
+fn emit_subquery(var st: Emit, inner: qbast.QbSelect, at: Str)
+    emit_text(var st, "(")
+    enter(var st)
+    emit_select(var st, inner, at)
+    leave(var st)
+    emit_text(var st, ")")
+
+// One expression.  THIS IS THE WALK, and the order of the arms below is
+// not the order of the bytes of any one expression — each arm writes
+// its own — but every arm writes its left operand before its right.
+fn emit_expr(var st: Emit, e: qbast.QbExpr, at: Str)
+    match e
+        QbCol(name)                               => emit_ident(var st, name, st.o.quote_all, at)
+        QbQual(table, column)                     =>
+            emit_ident(var st, table, st.o.quote_all, field(at, "table"))
+            emit_text(var st, ".")
+            emit_ident(var st, column, st.o.quote_all, field(at, "column"))
+        QbStar                                    => emit_text(var st, "*")
+        QbQualStar(table)                         =>
+            emit_ident(var st, table, st.o.quote_all, field(at, "table"))
+            emit_text(var st, ".*")
+        QbBind(value)                             => emit_bind(var st, value, at)
+        QbLit(value)                              => emit_lit_value(var st, value, at)
+        QbRaw(sql)                                =>
+            if st.o.forbid_raw
+                record(var st, QbRawForbidden, at)
+            emit_text(var st, sql)
+        QbCmp(op, lhs, rhs)                       => emit_cmp(var st, op, lhs, rhs, at)
+        QbBinop(op, lhs, rhs)                     => emit_binop(var st, op, lhs, rhs, at)
+        QbAnd(lhs, rhs)                           =>
+            emit_connective_operand(var st, lhs, field(at, "lhs"))
+            emit_text(var st, " AND ")
+            emit_connective_operand(var st, rhs, field(at, "rhs"))
+        QbOr(lhs, rhs)                            =>
+            emit_connective_operand(var st, lhs, field(at, "lhs"))
+            emit_text(var st, " OR ")
+            emit_connective_operand(var st, rhs, field(at, "rhs"))
+        QbNot(operand)                            =>
+            emit_text(var st, "NOT (")
+            emit_expr(var st, operand, field(at, "operand"))
+            emit_text(var st, ")")
+        QbIsNull(operand, negated)                =>
+            emit_operand(var st, operand, field(at, "operand"))
+            if negated
+                emit_text(var st, " IS NOT NULL")
+            else
+                emit_text(var st, " IS NULL")
+        QbIn(operand, values, negated)            => emit_in(var st, operand, values, negated, at)
+        QbInSelect(operand, inner, negated)       =>
+            emit_operand(var st, operand, field(at, "operand"))
+            if negated
+                emit_text(var st, " NOT IN ")
+            else
+                emit_text(var st, " IN ")
+            emit_subquery(var st, inner, field(at, "inner"))
+        QbBetween(operand, low, high, negated)    =>
+            emit_operand(var st, operand, field(at, "operand"))
+            if negated
+                emit_text(var st, " NOT BETWEEN ")
+            else
+                emit_text(var st, " BETWEEN ")
+            emit_operand(var st, low, field(at, "low"))
+            emit_text(var st, " AND ")
+            emit_operand(var st, high, field(at, "high"))
+        QbLike(operand, pattern, escape, negated) =>
+            emit_operand(var st, operand, field(at, "operand"))
+            if negated
+                emit_text(var st, " NOT LIKE ")
+            else
+                emit_text(var st, " LIKE ")
+            emit_operand(var st, pattern, field(at, "pattern"))
+            if escape != ""
+                emit_text(var st, " ESCAPE ")
+                emit_text_literal(var st, escape)
+        QbILike(operand, pattern, negated)        =>
+            note(var st, QbFeatILike, at)
+            emit_operand(var st, operand, field(at, "operand"))
+            if negated
+                emit_text(var st, " NOT ILIKE ")
+            else
+                emit_text(var st, " ILIKE ")
+            emit_operand(var st, pattern, field(at, "pattern"))
+        QbFn(name, args)                          =>
+            emit_text(var st, name)
+            emit_text(var st, "(")
+            emit_exprs(var st, args, field(at, "args"))
+            emit_text(var st, ")")
+        QbAgg(name, args, distinct, filter)       =>
+            emit_text(var st, name)
+            emit_text(var st, "(")
+            if distinct
+                emit_text(var st, "DISTINCT ")
+            emit_exprs(var st, args, field(at, "args"))
+            emit_text(var st, ")")
+            match filter
+                Some(cond) =>
+                    emit_text(var st, " FILTER (WHERE ")
+                    emit_expr(var st, cond, field(at, "filter"))
+                    emit_text(var st, ")")
+                None       => ()
+        QbCast(operand, ty)                       =>
+            emit_text(var st, "CAST(")
+            emit_expr(var st, operand, field(at, "operand"))
+            emit_text(var st, " AS ")
+            emit_text(var st, ty)
+            emit_text(var st, ")")
+        QbCase(whens, thens, otherwise)           => emit_case(var st, whens, thens, otherwise, at)
+        QbCoalesce(args)                          =>
+            emit_text(var st, "COALESCE(")
+            emit_exprs(var st, args, field(at, "args"))
+            emit_text(var st, ")")
+        QbExists(inner, negated)                  =>
+            if negated
+                emit_text(var st, "NOT EXISTS ")
+            else
+                emit_text(var st, "EXISTS ")
+            emit_subquery(var st, inner, field(at, "inner"))
+        QbScalar(inner)                           => emit_subquery(var st, inner, field(at, "inner"))
+
+// ── The clauses ──────────────────────────────────────────────────────
+
+// `ORDER BY a DESC NULLS LAST, …`.
+fn emit_order(var st: Emit, terms: [qbast.QbOrder], base: Str)
+    var i = 0
+    for t in terms
+        if i > 0
+            emit_text(var st, ", ")
+        let at = indexed(base, i)
+        emit_expr(var st, t.expr, field(at, "expr"))
+        if t.descending
+            emit_text(var st, " DESC")
+        if t.nulls != qbast.QbNullsDefault
+            note(var st, QbFeatNullsOrdering, at)
+            if t.nulls == qbast.QbNullsFirst
+                emit_text(var st, " NULLS FIRST")
+            else
+                emit_text(var st, " NULLS LAST")
+        i = i + 1
+
+// Column names separated by commas: an `INSERT`'s column list, a
+// conflict target, a CTE's column list.
+fn emit_idents(var st: Emit, names: [Str], base: Str)
+    var i = 0
+    for n in names
+        if i > 0
+            emit_text(var st, ", ")
+        emit_ident(var st, n, st.o.quote_all, indexed(base, i))
+        i = i + 1
+
+// `a, b AS c` — the items of a `SELECT` or a `RETURNING`.  `base` is
+// spelled by the caller because the same shape is `columns` in one
+// statement and `returning` in another, and a fault has to name the
+// field the caller's own tree has.
+fn emit_items(var st: Emit, cols: [qbast.QbColumn], base: Str, key: Str)
+    if list.len(cols) == 0
+        emit_text(var st, "*")
+    else
+        var i = 0
+        for c in cols
+            if i > 0
+                emit_text(var st, ", ")
+            let at = indexed(field(base, key), i)
+            emit_expr(var st, c.expr, field(at, "expr"))
+            if c.as_name != ""
+                emit_text(var st, " AS ")
+                emit_ident(var st, c.as_name, st.o.quote_all, field(at, "as_name"))
+            i = i + 1
+
+// `SET a = …, b = …`, which is the same shape in an `UPDATE` and in a
+// `DO UPDATE`.
+fn emit_assigns(var st: Emit, assigns: [qbast.QbAssign], base: Str)
+    var i = 0
+    for a in assigns
+        if i > 0
+            emit_text(var st, ", ")
+        let at = indexed(base, i)
+        emit_ident(var st, a.column, st.o.quote_all, field(at, "column"))
+        emit_text(var st, " = ")
+        emit_expr(var st, a.value, field(at, "value"))
+        i = i + 1
+
+// A table, a subquery or a CTE, with its alias.  A subquery with no
+// alias is a fault in PostgreSQL and MySQL and legal in SQLite, which
+// is a fact the table knows and this function asks for.
+fn emit_source(var st: Emit, src: qbast.QbSource, base: Str)
+    match src
+        QbTable(name, as_name)     =>
+            emit_ident(var st, name, st.o.quote_all, field(base, "name"))
+            emit_alias(var st, as_name, base)
+        QbSubquery(inner, as_name) =>
+            if as_name == ""
+                if not qbdialect.supports(st.o.dialect, QbFeatAnonymousSubquery)
+                    record(var st, QbSubqueryNeedsAlias, base)
+            emit_subquery(var st, inner, field(base, "inner"))
+            emit_alias(var st, as_name, base)
+        QbCteRef(name, as_name)    =>
+            emit_ident(var st, name, st.o.quote_all, field(base, "name"))
+            emit_alias(var st, as_name, base)
+
+// `AS alias`, when there is one.
+fn emit_alias(var st: Emit, as_name: Str, base: Str)
+    if as_name != ""
+        emit_text(var st, " AS ")
+        emit_ident(var st, as_name, st.o.quote_all, field(base, "as_name"))
+
+// `INNER JOIN t ON …`.  A `CROSS JOIN` takes no `ON` and a condition
+// the caller wrote on one is dropped rather than written, because
+// `CROSS JOIN t ON …` is not SQL any dialect accepts; every other kind
+// without one is refused by name.
+fn emit_join(var st: Emit, j: qbast.QbJoin, base: Str)
+    emit_text(var st, " ")
+    emit_join_kind(var st, j.kind, base)
+    emit_text(var st, " ")
+    emit_source(var st, j.source, field(base, "source"))
+    match j.on
+        Some(cond) =>
+            if j.kind != qbast.QbCross
+                emit_text(var st, " ON ")
+                emit_expr(var st, cond, field(base, "on"))
+        None       =>
+            if j.kind != qbast.QbCross
+                record(var st, QbJoinWithoutOn, field(base, "on"))
+
+// The join's keyword.  A full join is not in MySQL and is named rather
+// than written as an inner join; a right join is in all four and the
+// SQLite row says so on the strength of 3.39, which this package
+// cannot check.
+fn emit_join_kind(var st: Emit, kind: qbast.QbJoinKind, base: Str)
+    match kind
+        QbInner => emit_text(var st, "INNER JOIN")
+        QbLeft  => emit_text(var st, "LEFT JOIN")
+        QbRight => emit_text(var st, "RIGHT JOIN")
+        QbFull  =>
+            note(var st, QbFeatFullJoin, base)
+            emit_text(var st, "FULL OUTER JOIN")
+        QbCross => emit_text(var st, "CROSS JOIN")
+
+// `UNION ALL <select>`.  An arm's own `ORDER BY` or `LIMIT` is refused
+// everywhere: SQLite allows it and PostgreSQL does not, and the
+// brackets that would make it portable change what the clause applies
+// to.
+fn emit_arm(var st: Emit, arm: qbast.QbSetArm, base: Str)
+    if list.len(arm.body.order_by) > 0 or arm.body.limit >= 0 or arm.body.offset >= 0
+        record(var st, QbSetArmOrdered, field(base, "body"))
+    emit_text(var st, " ")
+    emit_set_word(var st, arm.op)
+    emit_text(var st, " ")
+    emit_select(var st, arm.body, field(base, "body"))
+
+// The set operation's keyword.
+fn emit_set_word(var st: Emit, op: qbast.QbSetOp)
+    match op
+        QbUnion     => emit_text(var st, "UNION")
+        QbUnionAll  => emit_text(var st, "UNION ALL")
+        QbIntersect => emit_text(var st, "INTERSECT")
+        QbExcept    => emit_text(var st, "EXCEPT")
+
+// `WITH RECURSIVE a AS (…), b AS (…)`.  One recursive CTE makes the
+// whole keyword recursive, which is why `recursive` is read across the
+// list rather than per CTE.
+fn emit_with(var st: Emit, ctes: [qbast.QbCte], base: Str)
+    if list.len(ctes) > 0
+        note(var st, QbFeatCte, base)
+        emit_text(var st, "WITH ")
+        if any_recursive(ctes)
+            note(var st, QbFeatRecursiveCte, base)
+            emit_text(var st, "RECURSIVE ")
+        var i = 0
+        for c in ctes
+            if i > 0
+                emit_text(var st, ", ")
+            let at = indexed(field(base, "ctes"), i)
+            if c.name == "" or cte_name_seen(ctes, c.name, i)
+                record(var st, QbCteName(c.name), at)
+            emit_ident(var st, c.name, st.o.quote_all, at)
+            if list.len(c.columns) > 0
+                emit_text(var st, " (")
+                emit_idents(var st, c.columns, field(at, "columns"))
+                emit_text(var st, ")")
+            emit_text(var st, " AS ")
+            emit_subquery(var st, c.body, field(at, "body"))
+            i = i + 1
+        // The clause after the list is the statement proper, so the
+        // list has to end with the gap every other clause ends with;
+        // without it the first word of the statement is glued to the
+        // last `)` and the whole thing is one identifier.
+        gap(var st)
+
+// Whether an earlier CTE in the list already took this name.
+fn cte_name_seen(ctes: [qbast.QbCte], name: Str, i: Int) -> Bool
+    var seen = false
+    for j in 0..i
+        let other = list.get(ctes, j)
+        if other.name == name
+            seen = true
+    seen
+
+// Whether any CTE in the list is recursive.
+fn any_recursive(ctes: [qbast.QbCte]) -> Bool
+    var found = false
+    for c in ctes
+        if c.recursive
+            found = true
+    found
+
+// `LIMIT n OFFSET m`.  SQLite needs a `LIMIT` in front of an `OFFSET`
+// and `-1` is its "no limit", so a bare offset is written as
+// `LIMIT -1 OFFSET m` there rather than refused — the dialect's own
+// spelling, not a translation of the caller's meaning.
+fn emit_tail(var st: Emit, sel: qbast.QbSelect, base: Str)
+    if sel.limit >= 0
+        gap(var st)
+        emit_text(var st, "LIMIT ")
+        emit_int(var st, sel.limit)
+    if sel.offset >= 0
+        if sel.limit < 0 and not qbdialect.supports(st.o.dialect, QbFeatBareOffset)
+            // A translation rather than a refusal, and reported for the
+            // same reason as the other three: the statement the caller
+            // wrote is not the statement the server will read.
+            note(var st, QbFeatBareOffset, field(base, "offset"))
+            gap(var st)
+            emit_text(var st, "LIMIT -1")
+        gap(var st)
+        emit_text(var st, "OFFSET ")
+        emit_int(var st, sel.offset)
+
+// The rows of an `INSERT … VALUES`, one bracket per row, with each
+// row's length checked against the column list before it is written.
+fn emit_rows(var st: Emit, ins: qbast.QbInsert, base: Str)
+    var r = 0
+    for row in ins.rows
+        if r > 0
+            emit_text(var st, ", ")
+        let at = indexed(field(base, "rows"), r)
+        if list.len(row) != list.len(ins.columns)
+            record(var st, QbInsertArity(list.len(ins.columns), list.len(row), r), at)
+        emit_text(var st, "(")
+        var c = 0
+        for cell in row
+            if c > 0
+                emit_text(var st, ", ")
+            emit_expr(var st, cell, indexed(at, c))
+            c = c + 1
+        emit_text(var st, ")")
+        r = r + 1
+
+// `ON CONFLICT …`, or MySQL's spelling of the same two ideas.  MySQL
+// has no conflict target at all — it uses whichever unique index was
+// hit — so a statement that named one is reported and written without
+// it rather than refused, because the upsert still does what the
+// caller asked for on the index the server picks.
+fn emit_conflict(var st: Emit, ins: qbast.QbInsert, base: Str)
+    if ins.conflict != qbast.QbConflictError
+        if st.o.dialect == QbMysql
+            if list.len(ins.conflict_columns) > 0
+                // MySQL renders the upsert and drops the target, so
+                // the drop is REPORTED rather than silent — the feature
+                // row exists precisely so a caller can see it happen.
+                note(var st, QbFeatConflictTarget, field(base, "conflict_columns"))
+            if ins.conflict == qbast.QbConflictUpdate
+                emit_text(var st, " ON DUPLICATE KEY UPDATE ")
+                emit_assigns(var st, ins.conflict_set, field(base, "conflict_set"))
+        else
+            emit_text(var st, " ON CONFLICT ")
+            if list.len(ins.conflict_columns) > 0
+                note(var st, QbFeatConflictTarget, field(base, "conflict_columns"))
+                emit_text(var st, "(")
+                emit_idents(var st, ins.conflict_columns,
+                            field(base, "conflict_columns"))
+                emit_text(var st, ") ")
+            if ins.conflict == qbast.QbConflictIgnore
+                emit_text(var st, "DO NOTHING")
+            else
+                emit_text(var st, "DO UPDATE SET ")
+                emit_assigns(var st, ins.conflict_set, field(base, "conflict_set"))
+                match ins.conflict_where
+                    Some(cond) =>
+                        emit_text(var st, " WHERE ")
+                        emit_expr(var st, cond, field(base, "conflict_where"))
+                    None       => ()
+
+// `RETURNING a, b`, or the dialect limit when the dialect has none.
+fn emit_returning(var st: Emit, cols: [qbast.QbColumn], base: Str)
+    if list.len(cols) > 0
+        note(var st, QbFeatReturning, base)
+        gap(var st)
+        emit_text(var st, "RETURNING ")
+        emit_items(var st, cols, base, "returning")
+
+// ── The statements ───────────────────────────────────────────────────
+
+// A `SELECT`, clause by clause in the order SQL writes them.  The
+// `WITH` list first, then the arms of a set operation, then the
+// parent's own `ORDER BY` and `LIMIT` — which is what those clauses
+// apply to, and the reason `qbast`'s walk is ordered the same way.
+fn emit_select(var st: Emit, sel: qbast.QbSelect, base: Str)
+    emit_with(var st, sel.ctes, base)
+    emit_text(var st, "SELECT ")
+    // `DISTINCT ON (…)` is one clause, not a `DISTINCT` with an `ON`
+    // after it: PostgreSQL parses the three words together, and
+    // `SELECT ON (x) *` is a syntax error.  So `distinct_on` writes
+    // its own `DISTINCT` and a select that carried both gets one.
+    if list.len(sel.distinct_on) > 0
+        note(var st, QbFeatDistinctOn, field(base, "distinct_on"))
+        emit_text(var st, "DISTINCT ON (")
+        emit_exprs(var st, sel.distinct_on, field(base, "distinct_on"))
+        emit_text(var st, ") ")
+    else if sel.distinct
+        emit_text(var st, "DISTINCT ")
+    emit_items(var st, sel.columns, base, "columns")
+    match sel.from
+        Some(src) =>
+            gap(var st)
+            emit_text(var st, "FROM ")
+            emit_source(var st, src, field(base, "from"))
+        None      => ()
+    var i = 0
+    for j in sel.joins
+        emit_join(var st, j, indexed(field(base, "joins"), i))
+        i = i + 1
+    match sel.where_
+        Some(cond) =>
+            gap(var st)
+            emit_text(var st, "WHERE ")
+            emit_expr(var st, cond, field(base, "where_"))
+        None       => ()
+    if list.len(sel.group_by) > 0
+        gap(var st)
+        emit_text(var st, "GROUP BY ")
+        emit_exprs(var st, sel.group_by, field(base, "group_by"))
+    match sel.having
+        Some(cond) =>
+            gap(var st)
+            emit_text(var st, "HAVING ")
+            emit_expr(var st, cond, field(base, "having"))
+        None       => ()
+    i = 0
+    for arm in sel.set_arms
+        emit_arm(var st, arm, indexed(field(base, "set_arms"), i))
+        i = i + 1
+    if list.len(sel.order_by) > 0
+        gap(var st)
+        emit_text(var st, "ORDER BY ")
+        emit_order(var st, sel.order_by, field(base, "order_by"))
+    emit_tail(var st, sel, base)
+    if sel.for_update
+        note(var st, QbFeatForUpdate, base)
+        gap(var st)
+        emit_text(var st, "FOR UPDATE")
+
+// `WITH …, INSERT INTO t (…) VALUES …|SELECT …, ON CONFLICT …,
+// RETURNING …`.  MySQL's `INSERT IGNORE` goes at the keyword rather
+// than at the conflict clause, which is why the conflict is read
+// before the target is written.
+fn emit_insert(var st: Emit, ins: qbast.QbInsert, base: Str)
+    emit_with(var st, ins.ctes, base)
+    emit_text(var st, "INSERT ")
+    if ins.conflict == qbast.QbConflictIgnore and st.o.dialect == QbMysql
+        emit_text(var st, "IGNORE ")
+    emit_text(var st, "INTO ")
+    emit_ident(var st, ins.table, st.o.quote_all, field(base, "table"))
+    if list.len(ins.columns) == 0
+        record(var st, QbInsertNoColumns, base)
+    else
+        emit_text(var st, " (")
+        emit_idents(var st, ins.columns, field(base, "columns"))
+        emit_text(var st, ")")
+    match ins.from_select
+        Some(inner) =>
+            if list.len(ins.rows) > 0
+                record(var st, QbInsertTwoSources, base)
+            gap(var st)
+            emit_subquery(var st, inner, field(base, "from_select"))
+        None        =>
+            if list.len(ins.rows) == 0
+                record(var st, QbInsertNoSource, base)
+            else
+                gap(var st)
+                emit_text(var st, "VALUES ")
+                emit_rows(var st, ins, base)
+    emit_conflict(var st, ins, base)
+    emit_returning(var st, ins.returning, base)
+
+// `WITH …, UPDATE t SET … FROM … WHERE … RETURNING …`.  An `UPDATE`
+// with nothing set is refused; one with no `WHERE` is not, unless the
+// caller turned `require_where` on.
+fn emit_update(var st: Emit, upd: qbast.QbUpdate, base: Str)
+    emit_with(var st, upd.ctes, base)
+    emit_text(var st, "UPDATE ")
+    emit_ident(var st, upd.table, st.o.quote_all, field(base, "table"))
+    if list.len(upd.set) == 0
+        record(var st, QbUpdateNothingSet, base)
+    else
+        gap(var st)
+        emit_text(var st, "SET ")
+        emit_assigns(var st, upd.set, field(base, "set"))
+    match upd.from
+        Some(src) =>
+            gap(var st)
+            emit_text(var st, "FROM ")
+            emit_source(var st, src, field(base, "from"))
+        None      => ()
+    match upd.where_
+        Some(cond) =>
+            gap(var st)
+            emit_text(var st, "WHERE ")
+            emit_expr(var st, cond, field(base, "where_"))
+        None       =>
+            if st.o.require_where
+                record(var st, QbWhereRequired, "")
+    emit_returning(var st, upd.returning, base)
+
+// `WITH …, DELETE FROM t WHERE … RETURNING …`.
+fn emit_delete(var st: Emit, del: qbast.QbDelete, base: Str)
+    emit_with(var st, del.ctes, base)
+    emit_text(var st, "DELETE FROM ")
+    emit_ident(var st, del.table, st.o.quote_all, field(base, "table"))
+    match del.where_
+        Some(cond) =>
+            gap(var st)
+            emit_text(var st, "WHERE ")
+            emit_expr(var st, cond, field(base, "where_"))
+        None       =>
+            if st.o.require_where
+                record(var st, QbWhereRequired, "")
+    emit_returning(var st, del.returning, base)
+
+fn emit_stmt(var st: Emit, s: qbast.QbStmt)
+    match s
+        QbStmtSelect(body) => emit_select(var st, body, "")
+        QbStmtInsert(body) => emit_insert(var st, body, "")
+        QbStmtUpdate(body) => emit_update(var st, body, "")
+        QbStmtDelete(body) => emit_delete(var st, body, "")
+
 // The defaults for a dialect: not pretty, quote only what needs it,
 // allow an unguarded write, allow raw, depth 64, 65 535 parameters.
 //
@@ -84,7 +1164,7 @@ pub struct QbRender
 //     println("${qbrender.options(QbPostgres).max_depth}")
 // ```
 pub fn options(d: qbdialect.QbDialect) -> QbRenderOptions []
-    todo("query-builder-nv.qbrender.options")
+    plain_options(d)
 
 // `o` with pretty-printing on.
 //
@@ -95,7 +1175,9 @@ pub fn options(d: qbdialect.QbDialect) -> QbRenderOptions []
 //     println("${qbrender.with_pretty(qbrender.options(QbSqlite), true).pretty}")
 // ```
 pub fn with_pretty(o: QbRenderOptions, pretty: Bool) -> QbRenderOptions []
-    todo("query-builder-nv.qbrender.with_pretty")
+    QbRenderOptions { dialect: o.dialect, pretty: pretty, quote_all: o.quote_all,
+                      require_where: o.require_where, forbid_raw: o.forbid_raw,
+                      max_depth: o.max_depth, max_params: o.max_params }
 
 // `o` refusing an `UPDATE` or `DELETE` with no `WHERE`.
 //
@@ -107,7 +1189,9 @@ pub fn with_pretty(o: QbRenderOptions, pretty: Bool) -> QbRenderOptions []
 //     println("${o.require_where}")
 // ```
 pub fn with_require_where(o: QbRenderOptions, require: Bool) -> QbRenderOptions []
-    todo("query-builder-nv.qbrender.with_require_where")
+    QbRenderOptions { dialect: o.dialect, pretty: o.pretty, quote_all: o.quote_all,
+                      require_where: require, forbid_raw: o.forbid_raw,
+                      max_depth: o.max_depth, max_params: o.max_params }
 
 // `o` refusing a statement that contains a `QbRaw`.
 //
@@ -119,13 +1203,15 @@ pub fn with_require_where(o: QbRenderOptions, require: Bool) -> QbRenderOptions 
 //     println("${o.forbid_raw}")
 // ```
 pub fn with_forbid_raw(o: QbRenderOptions, forbid: Bool) -> QbRenderOptions []
-    todo("query-builder-nv.qbrender.with_forbid_raw")
+    QbRenderOptions { dialect: o.dialect, pretty: o.pretty, quote_all: o.quote_all,
+                      require_where: o.require_where, forbid_raw: forbid,
+                      max_depth: o.max_depth, max_params: o.max_params }
 
 // A statement appended to `out`, with its parameters.
 //
 // The one call the package exists for.  Stops at the first fault,
 // which is what a caller about to execute wants; `check` answers all
-// of them.
+// of them.  A refused render appends nothing to `out`.
 //
 // ```novo
 // use std.list
@@ -141,10 +1227,13 @@ pub fn with_forbid_raw(o: QbRenderOptions, forbid: Bool) -> QbRenderOptions []
 // ```
 pub fn render(out: [u8], s: qbast.QbStmt,
               o: QbRenderOptions) -> Result<QbRender, qberror.QbFault> []
-    todo("query-builder-nv.qbrender.render")
+    var st = emitter(o, false, 0)
+    emit_stmt(var st, s)
+    finished(st, out)
 
 // A statement as a string, with its parameters — the convenience over
-// `render` for a caller that is not batching.
+// `render` for a caller that is not batching.  The terminating zero
+// `render` appends is stripped: `sql` is the statement.
 //
 // ```novo
 // use qbast
@@ -158,7 +1247,15 @@ pub fn render(out: [u8], s: qbast.QbStmt,
 //         Err(_) => println("no")
 // ```
 pub fn render_str(s: qbast.QbStmt, o: QbRenderOptions) -> Result<QbRenderedText, qberror.QbFault> []
-    todo("query-builder-nv.qbrender.render_str")
+    match render([], s, o)
+        Err(f) => Err(f)
+        Ok(r)  => rendered_text(r)
+
+// The `Str` form of a rendered statement.
+fn rendered_text(r: QbRender) -> Result<QbRenderedText, qberror.QbFault>
+    let n = list.len(r.text) - list.len(terminator())
+    let body = bytes.byte_list_to_str(list.slice(r.text, 0, n))
+    Ok(QbRenderedText { sql: body, params: r.params })
 
 // A rendered statement as text.
 pub struct QbRenderedText
@@ -188,13 +1285,17 @@ pub struct QbRenderedText
 // ```
 pub fn render_expr(out: [u8], e: qbast.QbExpr, o: QbRenderOptions,
                    first_param: Int) -> Result<QbRender, qberror.QbFault> []
-    todo("query-builder-nv.qbrender.render_expr")
+    var st = emitter(o, false, first_param)
+    emit_expr(var st, e, "")
+    finished(st, out)
 
 // Every fault in `s` for `o`'s dialect, in the order the render would
 // have met them.
 //
 // An empty list means `render` will succeed.  What a test asserts and
-// what a tool porting a program to another dialect reads.
+// what a tool porting a program to another dialect reads.  The dialect
+// limits that have a correct spelling anyway (`TRUE` in SQLite, a
+// conflict target in MySQL) appear here and would not stop a render.
 //
 // ```novo
 // use std.list
@@ -207,14 +1308,17 @@ pub fn render_expr(out: [u8], e: qbast.QbExpr, o: QbRenderOptions,
 //     println("${list.len(qbrender.check(QbStmtSelect(s), qbrender.options(QbSqlite)))}")
 // ```
 pub fn check(s: qbast.QbStmt, o: QbRenderOptions) -> [qberror.QbFault] []
-    todo("query-builder-nv.qbrender.check")
+    var st = emitter(o, true, 0)
+    emit_stmt(var st, s)
+    st.faults
 
 // The features `s` uses that `d` does not have, one fault each.
 //
 // The port question on its own: a caller moving from SQLite to
 // PostgreSQL calls this for every statement in their program and gets
 // the list of things to rewrite, without the malformed-statement
-// faults mixed in.
+// faults mixed in.  A dialect limit that the render writes another way
+// is in this list too, which is what a port wants to see.
 //
 // ```novo
 // use std.list
@@ -227,7 +1331,7 @@ pub fn check(s: qbast.QbStmt, o: QbRenderOptions) -> [qberror.QbFault] []
 //     println("${list.len(qbrender.unsupported(QbStmtSelect(s), QbMysql))}")
 // ```
 pub fn unsupported(s: qbast.QbStmt, d: qbdialect.QbDialect) -> [qberror.QbFault] []
-    todo("query-builder-nv.qbrender.unsupported")
+    qberror.dialect_limits(check(s, plain_options(d)))
 
 // True when `s` is an `UPDATE` or `DELETE` with no `WHERE` — a
 // statement that touches every row.
@@ -245,11 +1349,26 @@ pub fn unsupported(s: qbast.QbStmt, d: qbdialect.QbDialect) -> [qberror.QbFault]
 //     println("${qbrender.unguarded(QbStmtDelete(qbbuild.delete("sessions")))}")
 // ```
 pub fn unguarded(s: qbast.QbStmt) -> Bool []
-    todo("query-builder-nv.qbrender.unguarded")
+    match s
+        QbStmtUpdate(body) => absent(body.where_)
+        QbStmtDelete(body) => absent(body.where_)
+        QbStmtSelect(body) => false
+        QbStmtInsert(body) => false
+
+// Whether an optional condition is absent.  Its own function because
+// the two arms above are the question this call answers, and a `match`
+// inside a `match` arm is a shape the 0.20.2 compiler strands cells in
+// (memory-perceus/a-nested-match-with-a-method-answer-arm-leaks-the-
+// enclosing-subject).
+fn absent(cond: ?qbast.QbExpr) -> Bool
+    match cond
+        Some(_) => false
+        None    => true
 
 // How many bytes `render` will append, without appending them.
 //
-// Exact, not an estimate: the same walk, counting instead of writing.
+// Exact, not an estimate: the same walk, counting instead of writing,
+// and counting the terminating zero `render` appends.
 //
 // ```novo
 // use qbast
@@ -263,7 +1382,12 @@ pub fn unguarded(s: qbast.QbStmt) -> Bool []
 //         Err(_) => println("no")
 // ```
 pub fn render_len(s: qbast.QbStmt, o: QbRenderOptions) -> Result<Int, qberror.QbFault> []
-    todo("query-builder-nv.qbrender.render_len")
+    var st = emitter(o, true, 0)
+    emit_stmt(var st, s)
+    if list.len(st.stops) > 0
+        Err(list.get(st.stops, 0))
+    else
+        Ok(st.count + list.len(terminator()))
 
 // One identifier appended to `out`, quoted if it needs quoting in this
 // dialect.
@@ -275,7 +1399,11 @@ pub fn render_len(s: qbast.QbStmt, o: QbRenderOptions) -> Result<Int, qberror.Qb
 // quote at all.
 //
 // `QbUnquotableIdent` for a name that needs quoting in a dialect that
-// cannot quote, which is every reserved word in `QbSqlEngine`.
+// cannot quote: a name that is not a bare identifier there, or one
+// another dialect reserves, in `QbSqlEngine`.  No zero byte is
+// appended — this is called in the middle of a statement — which is
+// why its answer is one byte shorter than `write_literal`'s for the
+// same name.
 //
 // ```novo
 // use std.list
@@ -288,7 +1416,12 @@ pub fn render_len(s: qbast.QbStmt, o: QbRenderOptions) -> Result<Int, qberror.Qb
 // ```
 pub fn write_ident(out: [u8], name: Str, d: qbdialect.QbDialect,
                    always: Bool) -> Result<[u8], qberror.QbFault> []
-    todo("query-builder-nv.qbrender.write_ident")
+    match ident_kind(name, d, always)
+        Some(k) => Err(qberror.fault(k, ""))
+        None    =>
+            var st = emitter(plain_options(d), false, 0)
+            emit_ident_bytes(var st, name, d, always)
+            Ok(append_into(out, st.bytes))
 
 // One value appended to `out` as a LITERAL, escaped for this dialect.
 //
@@ -296,6 +1429,8 @@ pub fn write_ident(out: [u8], name: Str, d: qbdialect.QbDialect,
 // constant they control.  NOT a substitute for binding: an escaped
 // literal is still a value in the query's text, which is what changes
 // the plan cache and what makes a log of the SQL a log of the data.
+//
+// The answer ends with the same zero byte `render` appends.
 //
 // ```novo
 // use std.list
@@ -309,7 +1444,15 @@ pub fn write_ident(out: [u8], name: Str, d: qbdialect.QbDialect,
 // ```
 pub fn write_literal(out: [u8], v: qbast.QbValue,
                      d: qbdialect.QbDialect) -> Result<[u8], qberror.QbFault> []
-    todo("query-builder-nv.qbrender.write_literal")
+    var st = emitter(plain_options(d), false, 0)
+    emit_lit_value(var st, v, "")
+    if list.len(st.stops) > 0
+        // cov: skip — one value literal records no refusal: the only
+        // feature writing one can use, the boolean literal, is
+        // reported and not refused, so this render never fills `stops`
+        Err(list.get(st.stops, 0))
+    else
+        Ok(append_terminated(out, st.bytes))
 
 // How many `QbRaw` expressions `s` contains — `qbast.raw_count`, named
 // here too because this is the module a reviewer is reading when they
@@ -324,7 +1467,7 @@ pub fn write_literal(out: [u8], v: qbast.QbValue,
 //     println("${qbrender.raw_sites(QbStmtSelect(qbbuild.select()))}")
 // ```
 pub fn raw_sites(s: qbast.QbStmt) -> Int []
-    todo("query-builder-nv.qbrender.raw_sites")
+    qbast.raw_count(s)
 
 // The SQL this package cannot build, as one line each.
 //
@@ -340,4 +1483,13 @@ pub fn raw_sites(s: qbast.QbStmt) -> Int []
 //     println("${list.len(qbrender.cannot_build())}")
 // ```
 pub fn cannot_build() -> [Str] []
-    todo("query-builder-nv.qbrender.cannot_build")
+    [
+        "CREATE, ALTER, DROP and GRANT: data definition is an ordered, reversible list of changes rather than a statement",
+        "window functions: OVER (PARTITION BY … ORDER BY … ROWS …) is a grammar of its own; splice the SELECT item with QbRaw",
+        "GROUPING SETS, CUBE and ROLLUP",
+        "VALUES as a table source, LATERAL, TABLESAMPLE and table functions",
+        "locking beyond FOR UPDATE: no FOR SHARE, SKIP LOCKED or NOWAIT",
+        "vendor hints and comments: the sql-engine dialect reads -- as two minus signs, so a comment there does not parse",
+        "type translation: QbCast writes the type name as given, because TEXT is not VARCHAR is not STRING",
+        "execution: nothing here opens a connection, and QbRender.text and QbRender.params go to a driver",
+        "a device build: a statement is a tree of lists of strings, and a device that talks to a database talks to it over a network"]

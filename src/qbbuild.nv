@@ -1,15 +1,19 @@
 // qbbuild.nv — the builder chain: an empty statement, and one call per
 // fact added to it.
 //
-// Every body here is a `todo()`; the signatures are the design.
+// WHY THERE IS A MODULE FOR THIS AT ALL.  A query is assembled
+// conditionally: three filters from a request, two of which are
+// absent.  A struct literal is the wrong shape for that — it names
+// every field at once and then never grows — and one call per fact
+// added is the shape the other builders have too (SeaQuery, sqlx and
+// SQLAlchemy Core all read like this).
 //
-// WHY THERE IS A MODULE FOR THIS AT ALL.  A struct literal cannot be
-// written from another module, so a consumer cannot spell
-// `QbSelect { … }` and every statement has to be built by calls.  That
-// turns out to be the shape a query builder wants anyway — SeaQuery,
-// sqlx and SQLAlchemy Core all look like this — because a query is
-// assembled conditionally: three filters from a request, two of which
-// are absent.
+// A LITERAL IS WRITABLE FROM ANOTHER MODULE, which is measured rather
+// than assumed: the interface release's first paragraph said otherwise
+// and a probe on this compiler refuses it.  What a literal cannot do is
+// grow, and the fields of these structs are immutable — so every step
+// of the chain is a fresh literal, and the calls here are names for
+// those literals a caller would otherwise write out by hand.
 //
 // EVERY CALL ANSWERS A NEW STATEMENT.  `where_(s, e)` does not mutate
 // `s`; it answers the select with one more condition.  So a caller
@@ -27,7 +31,247 @@
 // ordinary comparison binds by construction and a caller has to go out
 // of their way — `QbLit` or `QbRaw` — to put a value in the text.
 
+use std.list
+use std.str
 use qbast
+
+// ── The parts, and the copies a call answers ─────────────────────────
+//
+// Every `with_*` below answers a COPY of a statement with one field
+// replaced, and that is what makes each call in the sections above a
+// new statement rather than a shared one.  The shape is forced: a
+// struct field is immutable unless it is declared `var`, these structs
+// are reference types, and a write through a shared one would be seen
+// through every name that holds the statement — the caller's base
+// among them.  A fresh literal is the only spelling of "a new
+// statement", and it is spelled once per field here rather than once
+// per call below.
+
+// A value at the point it is used.
+fn bound(v: qbast.QbValue) -> qbast.QbExpr
+    QbBind(v)
+
+// The same, one per element.
+fn bound_all(values: [qbast.QbValue]) -> [qbast.QbExpr]
+    var out: [qbast.QbExpr] = []
+    for v in values
+        list.push(out, bound(v))
+    out
+
+// A selected column, by name, with no alias.
+fn named_column(name: Str) -> qbast.QbColumn
+    QbColumn { expr: QbCol(name), as_name: "" }
+
+// The same, one per name, in the order the names are given.
+fn named_columns(names: [Str]) -> [qbast.QbColumn]
+    var cols: [qbast.QbColumn] = []
+    for n in names
+        list.push(cols, named_column(n))
+    cols
+
+// `e` ANDed onto `prev`, which is absent when there was no condition
+// yet.
+fn and_onto(prev: ?qbast.QbExpr, e: qbast.QbExpr) -> qbast.QbExpr
+    match prev
+        Some(existing) => QbAnd(existing, e)
+        None           => e
+
+// `e` ORed onto `prev`, which is absent when there was no condition
+// yet.
+fn or_onto(prev: ?qbast.QbExpr, e: qbast.QbExpr) -> qbast.QbExpr
+    match prev
+        Some(existing) => QbOr(existing, e)
+        None           => e
+
+// `parts` folded with `QbAnd`, or with `QbOr` when `is_and` is false.
+//
+// The empty fold answers a LITERAL — true for `AND`, false for `OR` —
+// because those are the two identities and they are opposite; a
+// one-element fold answers that element rather than a wrapper around
+// it.
+fn fold_parts(parts: [qbast.QbExpr], is_and: Bool) -> qbast.QbExpr
+    if list.len(parts) == 0
+        QbLit(QbBool(is_and))
+    else if list.len(parts) == 1
+        list.get(parts, 0)
+    else
+        var acc = list.get(parts, 0)
+        for i in 1..list.len(parts)
+            acc = combined(is_and, acc, list.get(parts, i))
+        acc
+
+// One step of the fold above.
+fn combined(is_and: Bool, a: qbast.QbExpr, b: qbast.QbExpr) -> qbast.QbExpr
+    if is_and
+        QbAnd(a, b)
+    else
+        QbOr(a, b)
+
+// A join.  A cross join carries no `ON` — `CROSS JOIN t ON …` is a
+// syntax error in SQLite and PostgreSQL — so a condition passed for one
+// is dropped rather than written into SQL that cannot parse.  This
+// signature has no spelling for "no condition", so the drop happens
+// here; `CHANGELOG.md` records it under `### Known`.
+fn assembled_join(kind: qbast.QbJoinKind, table: Str, as_name: Str,
+                  on: qbast.QbExpr) -> qbast.QbJoin
+    if kind == QbCross
+        QbJoin { kind: kind, source: QbTable(table, as_name), on: None }
+    else
+        QbJoin { kind: kind, source: QbTable(table, as_name), on: Some(on) }
+
+// The item a count selects.
+fn count_column() -> qbast.QbColumn
+    QbColumn { expr: QbFn("COUNT", [QbStar]), as_name: "" }
+
+// `s` with its `SELECT` items replaced.
+fn with_columns(s: qbast.QbSelect, columns: [qbast.QbColumn]) -> qbast.QbSelect
+    QbSelect { ctes: s.ctes, distinct: s.distinct, distinct_on: s.distinct_on,
+               columns: columns, from: s.from, joins: s.joins, where_: s.where_,
+               group_by: s.group_by, having: s.having, order_by: s.order_by,
+               limit: s.limit, offset: s.offset, set_arms: s.set_arms,
+               for_update: s.for_update }
+
+// `s` with `SELECT DISTINCT` set or cleared.
+fn with_distinct(s: qbast.QbSelect, on: Bool) -> qbast.QbSelect
+    QbSelect { ctes: s.ctes, distinct: on, distinct_on: s.distinct_on,
+               columns: s.columns, from: s.from, joins: s.joins,
+               where_: s.where_, group_by: s.group_by, having: s.having,
+               order_by: s.order_by, limit: s.limit, offset: s.offset,
+               set_arms: s.set_arms, for_update: s.for_update }
+
+// `s` reading from `src`, or from nothing when it is absent.
+fn with_from(s: qbast.QbSelect, src: ?qbast.QbSource) -> qbast.QbSelect
+    QbSelect { ctes: s.ctes, distinct: s.distinct, distinct_on: s.distinct_on,
+               columns: s.columns, from: src, joins: s.joins, where_: s.where_,
+               group_by: s.group_by, having: s.having, order_by: s.order_by,
+               limit: s.limit, offset: s.offset, set_arms: s.set_arms,
+               for_update: s.for_update }
+
+// `s` with its joins replaced, in the order they are applied.
+fn with_joins(s: qbast.QbSelect, joins: [qbast.QbJoin]) -> qbast.QbSelect
+    QbSelect { ctes: s.ctes, distinct: s.distinct, distinct_on: s.distinct_on,
+               columns: s.columns, from: s.from, joins: joins, where_: s.where_,
+               group_by: s.group_by, having: s.having, order_by: s.order_by,
+               limit: s.limit, offset: s.offset, set_arms: s.set_arms,
+               for_update: s.for_update }
+
+// `s` with its `WHERE` replaced — absent for no condition.
+fn with_where(s: qbast.QbSelect, cond: ?qbast.QbExpr) -> qbast.QbSelect
+    QbSelect { ctes: s.ctes, distinct: s.distinct, distinct_on: s.distinct_on,
+               columns: s.columns, from: s.from, joins: s.joins, where_: cond,
+               group_by: s.group_by, having: s.having, order_by: s.order_by,
+               limit: s.limit, offset: s.offset, set_arms: s.set_arms,
+               for_update: s.for_update }
+
+// `s` with its `GROUP BY` terms replaced.
+fn with_group_by(s: qbast.QbSelect, terms: [qbast.QbExpr]) -> qbast.QbSelect
+    QbSelect { ctes: s.ctes, distinct: s.distinct, distinct_on: s.distinct_on,
+               columns: s.columns, from: s.from, joins: s.joins, where_: s.where_,
+               group_by: terms, having: s.having, order_by: s.order_by,
+               limit: s.limit, offset: s.offset, set_arms: s.set_arms,
+               for_update: s.for_update }
+
+// `s` with its `HAVING` replaced — absent for no condition.
+fn with_having(s: qbast.QbSelect, cond: ?qbast.QbExpr) -> qbast.QbSelect
+    QbSelect { ctes: s.ctes, distinct: s.distinct, distinct_on: s.distinct_on,
+               columns: s.columns, from: s.from, joins: s.joins, where_: s.where_,
+               group_by: s.group_by, having: cond, order_by: s.order_by,
+               limit: s.limit, offset: s.offset, set_arms: s.set_arms,
+               for_update: s.for_update }
+
+// `s` with its `ORDER BY` terms replaced.
+fn with_order_by(s: qbast.QbSelect, terms: [qbast.QbOrder]) -> qbast.QbSelect
+    QbSelect { ctes: s.ctes, distinct: s.distinct, distinct_on: s.distinct_on,
+               columns: s.columns, from: s.from, joins: s.joins, where_: s.where_,
+               group_by: s.group_by, having: s.having, order_by: terms,
+               limit: s.limit, offset: s.offset, set_arms: s.set_arms,
+               for_update: s.for_update }
+
+// `s` with its row limit replaced.  `-1` is no limit.
+fn with_limit(s: qbast.QbSelect, n: Int) -> qbast.QbSelect
+    QbSelect { ctes: s.ctes, distinct: s.distinct, distinct_on: s.distinct_on,
+               columns: s.columns, from: s.from, joins: s.joins, where_: s.where_,
+               group_by: s.group_by, having: s.having, order_by: s.order_by,
+               limit: n, offset: s.offset, set_arms: s.set_arms,
+               for_update: s.for_update }
+
+// `s` with its offset replaced.  `-1` is no offset.
+fn with_offset(s: qbast.QbSelect, n: Int) -> qbast.QbSelect
+    QbSelect { ctes: s.ctes, distinct: s.distinct, distinct_on: s.distinct_on,
+               columns: s.columns, from: s.from, joins: s.joins, where_: s.where_,
+               group_by: s.group_by, having: s.having, order_by: s.order_by,
+               limit: s.limit, offset: n, set_arms: s.set_arms,
+               for_update: s.for_update }
+
+// `s` with its `WITH` clauses replaced, in order.
+fn with_ctes(s: qbast.QbSelect, ctes: [qbast.QbCte]) -> qbast.QbSelect
+    QbSelect { ctes: ctes, distinct: s.distinct, distinct_on: s.distinct_on,
+               columns: s.columns, from: s.from, joins: s.joins, where_: s.where_,
+               group_by: s.group_by, having: s.having, order_by: s.order_by,
+               limit: s.limit, offset: s.offset, set_arms: s.set_arms,
+               for_update: s.for_update }
+
+// `s` with its set-operation arms replaced, in order.
+fn with_set_arms(s: qbast.QbSelect, arms: [qbast.QbSetArm]) -> qbast.QbSelect
+    QbSelect { ctes: s.ctes, distinct: s.distinct, distinct_on: s.distinct_on,
+               columns: s.columns, from: s.from, joins: s.joins, where_: s.where_,
+               group_by: s.group_by, having: s.having, order_by: s.order_by,
+               limit: s.limit, offset: s.offset, set_arms: arms,
+               for_update: s.for_update }
+
+// `i` with its rows replaced, each row already bound.
+fn with_rows(i: qbast.QbInsert, rows: [[qbast.QbExpr]]) -> qbast.QbInsert
+    QbInsert { ctes: i.ctes, table: i.table, columns: i.columns, rows: rows,
+               from_select: i.from_select, conflict: i.conflict,
+               conflict_columns: i.conflict_columns, conflict_set: i.conflict_set,
+               conflict_where: i.conflict_where, returning: i.returning }
+
+// `i` with its source select replaced — absent when it is filled from
+// rows.
+fn with_insert_select(i: qbast.QbInsert, inner: ?qbast.QbSelect) -> qbast.QbInsert
+    QbInsert { ctes: i.ctes, table: i.table, columns: i.columns, rows: i.rows,
+               from_select: inner, conflict: i.conflict,
+               conflict_columns: i.conflict_columns, conflict_set: i.conflict_set,
+               conflict_where: i.conflict_where, returning: i.returning }
+
+// `i` with its conflict clause replaced: what to do, the target columns
+// and the assignments.
+fn with_conflict(i: qbast.QbInsert, kind: qbast.QbConflict, target: [Str],
+                 sets: [qbast.QbAssign]) -> qbast.QbInsert
+    QbInsert { ctes: i.ctes, table: i.table, columns: i.columns, rows: i.rows,
+               from_select: i.from_select, conflict: kind,
+               conflict_columns: target, conflict_set: sets,
+               conflict_where: i.conflict_where, returning: i.returning }
+
+// `i` with its `RETURNING` items replaced.
+fn with_insert_returning(i: qbast.QbInsert, items: [qbast.QbColumn]) -> qbast.QbInsert
+    QbInsert { ctes: i.ctes, table: i.table, columns: i.columns, rows: i.rows,
+               from_select: i.from_select, conflict: i.conflict,
+               conflict_columns: i.conflict_columns, conflict_set: i.conflict_set,
+               conflict_where: i.conflict_where, returning: items }
+
+// `u` with its assignments replaced.
+fn with_updates(u: qbast.QbUpdate, sets: [qbast.QbAssign]) -> qbast.QbUpdate
+    QbUpdate { ctes: u.ctes, table: u.table, set: sets, from: u.from,
+               where_: u.where_, returning: u.returning }
+
+// `u` with its condition replaced — absent for no condition.
+fn with_update_where(u: qbast.QbUpdate, cond: ?qbast.QbExpr) -> qbast.QbUpdate
+    QbUpdate { ctes: u.ctes, table: u.table, set: u.set, from: u.from,
+               where_: cond, returning: u.returning }
+
+// `u` with its `RETURNING` items replaced.
+fn with_update_returning(u: qbast.QbUpdate, items: [qbast.QbColumn]) -> qbast.QbUpdate
+    QbUpdate { ctes: u.ctes, table: u.table, set: u.set, from: u.from,
+               where_: u.where_, returning: items }
+
+// `d` with its condition replaced — absent for no condition.
+fn with_delete_where(d: qbast.QbDelete, cond: ?qbast.QbExpr) -> qbast.QbDelete
+    QbDelete { ctes: d.ctes, table: d.table, where_: cond, returning: d.returning }
+
+// `d` with its `RETURNING` items replaced.
+fn with_delete_returning(d: qbast.QbDelete, items: [qbast.QbColumn]) -> qbast.QbDelete
+    QbDelete { ctes: d.ctes, table: d.table, where_: d.where_, returning: items }
 
 // ── values ───────────────────────────────────────────────────────────
 
@@ -40,7 +284,7 @@ use qbast
 //     println("${qbbuild.int_value(7)}")
 // ```
 pub fn int_value(v: Int) -> qbast.QbValue []
-    todo("query-builder-nv.qbbuild.int_value")
+    QbInt(v)
 
 // A text value.
 //
@@ -51,7 +295,7 @@ pub fn int_value(v: Int) -> qbast.QbValue []
 //     println("${qbbuild.text_value("ada")}")
 // ```
 pub fn text_value(v: Str) -> qbast.QbValue []
-    todo("query-builder-nv.qbbuild.text_value")
+    QbText(v)
 
 // A float value.
 //
@@ -62,7 +306,7 @@ pub fn text_value(v: Str) -> qbast.QbValue []
 //     println("${qbbuild.float_value(1.5)}")
 // ```
 pub fn float_value(v: Float) -> qbast.QbValue []
-    todo("query-builder-nv.qbbuild.float_value")
+    QbFloat(v)
 
 // A boolean value.
 //
@@ -73,7 +317,7 @@ pub fn float_value(v: Float) -> qbast.QbValue []
 //     println("${qbbuild.bool_value(true)}")
 // ```
 pub fn bool_value(v: Bool) -> qbast.QbValue []
-    todo("query-builder-nv.qbbuild.bool_value")
+    QbBool(v)
 
 // A blob value.
 //
@@ -84,7 +328,7 @@ pub fn bool_value(v: Bool) -> qbast.QbValue []
 //     println("${qbbuild.blob_value([])}")
 // ```
 pub fn blob_value(v: [u8]) -> qbast.QbValue []
-    todo("query-builder-nv.qbbuild.blob_value")
+    QbBlob(v)
 
 // ── the comparisons, which bind by construction ──────────────────────
 
@@ -101,7 +345,7 @@ pub fn blob_value(v: [u8]) -> qbast.QbValue []
 //     println("${qbbuild.eq("id", qbbuild.int_value(7))}")
 // ```
 pub fn eq(column: Str, v: qbast.QbValue) -> qbast.QbExpr []
-    todo("query-builder-nv.qbbuild.eq")
+    QbCmp(QbEq, QbCol(column), bound(v))
 
 // `column <> ?`, with `v` bound.
 //
@@ -112,7 +356,7 @@ pub fn eq(column: Str, v: qbast.QbValue) -> qbast.QbExpr []
 //     println("${qbbuild.ne("id", qbbuild.int_value(7))}")
 // ```
 pub fn ne(column: Str, v: qbast.QbValue) -> qbast.QbExpr []
-    todo("query-builder-nv.qbbuild.ne")
+    QbCmp(QbNe, QbCol(column), bound(v))
 
 // `column < ?`, with `v` bound.
 //
@@ -123,7 +367,7 @@ pub fn ne(column: Str, v: qbast.QbValue) -> qbast.QbExpr []
 //     println("${qbbuild.lt("age", qbbuild.int_value(30))}")
 // ```
 pub fn lt(column: Str, v: qbast.QbValue) -> qbast.QbExpr []
-    todo("query-builder-nv.qbbuild.lt")
+    QbCmp(QbLt, QbCol(column), bound(v))
 
 // `column > ?`, with `v` bound.
 //
@@ -134,7 +378,7 @@ pub fn lt(column: Str, v: qbast.QbValue) -> qbast.QbExpr []
 //     println("${qbbuild.gt("age", qbbuild.int_value(30))}")
 // ```
 pub fn gt(column: Str, v: qbast.QbValue) -> qbast.QbExpr []
-    todo("query-builder-nv.qbbuild.gt")
+    QbCmp(QbGt, QbCol(column), bound(v))
 
 // `column <= ?`, with `v` bound.
 //
@@ -145,7 +389,7 @@ pub fn gt(column: Str, v: qbast.QbValue) -> qbast.QbExpr []
 //     println("${qbbuild.le("age", qbbuild.int_value(30))}")
 // ```
 pub fn le(column: Str, v: qbast.QbValue) -> qbast.QbExpr []
-    todo("query-builder-nv.qbbuild.le")
+    QbCmp(QbLe, QbCol(column), bound(v))
 
 // `column >= ?`, with `v` bound.
 //
@@ -156,7 +400,7 @@ pub fn le(column: Str, v: qbast.QbValue) -> qbast.QbExpr []
 //     println("${qbbuild.ge("age", qbbuild.int_value(30))}")
 // ```
 pub fn ge(column: Str, v: qbast.QbValue) -> qbast.QbExpr []
-    todo("query-builder-nv.qbbuild.ge")
+    QbCmp(QbGe, QbCol(column), bound(v))
 
 // `column IN (?, ?, …)`, every value bound.
 //
@@ -171,7 +415,7 @@ pub fn ge(column: Str, v: qbast.QbValue) -> qbast.QbExpr []
 //     println("${qbbuild.in_values("id", [qbbuild.int_value(1)])}")
 // ```
 pub fn in_values(column: Str, values: [qbast.QbValue]) -> qbast.QbExpr []
-    todo("query-builder-nv.qbbuild.in_values")
+    QbIn(QbCol(column), bound_all(values), false)
 
 // `column LIKE ?`, with the pattern bound.
 //
@@ -188,7 +432,7 @@ pub fn in_values(column: Str, values: [qbast.QbValue]) -> qbast.QbExpr []
 //     println("${qbbuild.like("name", "ada%")}")
 // ```
 pub fn like(column: Str, pattern: Str) -> qbast.QbExpr []
-    todo("query-builder-nv.qbbuild.like")
+    QbLike(QbCol(column), bound(QbText(pattern)), "", false)
 
 // `pattern` with `%`, `_` and the escape character itself prefixed by
 // `\`, for a search that means the characters literally.
@@ -204,7 +448,14 @@ pub fn like(column: Str, pattern: Str) -> qbast.QbExpr []
 //     println(qbbuild.escape_like("100%"))
 // ```
 pub fn escape_like(pattern: Str) -> Str []
-    todo("query-builder-nv.qbbuild.escape_like")
+    var out = ""
+    for i in 0..str.len(pattern)
+        let b = str.byte_at_or(pattern, i, 0)
+        if b == 92 or b == 37 or b == 95
+            out = out + "\\" + str.from_byte(b)
+        else
+            out = out + str.from_byte(b)
+    out
 
 // `column IS NULL`.
 //
@@ -215,7 +466,7 @@ pub fn escape_like(pattern: Str) -> Str []
 //     println("${qbbuild.is_null("deleted_at")}")
 // ```
 pub fn is_null(column: Str) -> qbast.QbExpr []
-    todo("query-builder-nv.qbbuild.is_null")
+    QbIsNull(QbCol(column), false)
 
 // `column IS NOT NULL`.
 //
@@ -226,7 +477,7 @@ pub fn is_null(column: Str) -> qbast.QbExpr []
 //     println("${qbbuild.is_not_null("deleted_at")}")
 // ```
 pub fn is_not_null(column: Str) -> qbast.QbExpr []
-    todo("query-builder-nv.qbbuild.is_not_null")
+    QbIsNull(QbCol(column), true)
 
 // `column BETWEEN ? AND ?`, both bound, both ends included.
 //
@@ -237,7 +488,7 @@ pub fn is_not_null(column: Str) -> qbast.QbExpr []
 //     println("${qbbuild.between("age", qbbuild.int_value(18), qbbuild.int_value(30))}")
 // ```
 pub fn between(column: Str, low: qbast.QbValue, high: qbast.QbValue) -> qbast.QbExpr []
-    todo("query-builder-nv.qbbuild.between")
+    QbBetween(QbCol(column), bound(low), bound(high), false)
 
 // `a AND b`.
 //
@@ -249,7 +500,7 @@ pub fn between(column: Str, low: qbast.QbValue, high: qbast.QbValue) -> qbast.Qb
 //     println("${qbbuild.all_of([a, a])}")
 // ```
 pub fn all_of(parts: [qbast.QbExpr]) -> qbast.QbExpr []
-    todo("query-builder-nv.qbbuild.all_of")
+    fold_parts(parts, true)
 
 // `a OR b`.
 //
@@ -267,7 +518,7 @@ pub fn all_of(parts: [qbast.QbExpr]) -> qbast.QbExpr []
 //     println("${qbbuild.any_of([a, a])}")
 // ```
 pub fn any_of(parts: [qbast.QbExpr]) -> qbast.QbExpr []
-    todo("query-builder-nv.qbbuild.any_of")
+    fold_parts(parts, false)
 
 // ── SELECT ───────────────────────────────────────────────────────────
 
@@ -285,7 +536,10 @@ pub fn any_of(parts: [qbast.QbExpr]) -> qbast.QbExpr []
 //     println("${list.len(qbbuild.select().columns)}")
 // ```
 pub fn select() -> qbast.QbSelect []
-    todo("query-builder-nv.qbbuild.select")
+    QbSelect { ctes: [], distinct: false, distinct_on: [], columns: [],
+               from: None, joins: [], where_: None, group_by: [], having: None,
+               order_by: [], limit: -1, offset: -1, set_arms: [],
+               for_update: false }
 
 // `s` reading from `table`, with an optional alias.
 //
@@ -296,7 +550,7 @@ pub fn select() -> qbast.QbSelect []
 //     println("${qbbuild.from(qbbuild.select(), "users", "u").joins}")
 // ```
 pub fn from(s: qbast.QbSelect, table: Str, as_name: Str) -> qbast.QbSelect []
-    todo("query-builder-nv.qbbuild.from")
+    with_from(s, Some(QbTable(table, as_name)))
 
 // `s` reading from a subquery, which must have an alias in PostgreSQL
 // and MySQL.
@@ -309,7 +563,7 @@ pub fn from(s: qbast.QbSelect, table: Str, as_name: Str) -> qbast.QbSelect []
 //     println("${qbbuild.from_select(qbbuild.select(), inner, "u").limit}")
 // ```
 pub fn from_select(s: qbast.QbSelect, inner: qbast.QbSelect, as_name: Str) -> qbast.QbSelect []
-    todo("query-builder-nv.qbbuild.from_select")
+    with_from(s, Some(QbSubquery(inner, as_name)))
 
 // `s` with one more selected column, by name.
 //
@@ -321,7 +575,8 @@ pub fn from_select(s: qbast.QbSelect, inner: qbast.QbSelect, as_name: Str) -> qb
 //     println("${list.len(qbbuild.column(qbbuild.select(), "id").columns)}")
 // ```
 pub fn column(s: qbast.QbSelect, name: Str) -> qbast.QbSelect []
-    todo("query-builder-nv.qbbuild.column")
+    let cols = list.concat(s.columns, [named_column(name)])
+    with_columns(s, cols)
 
 // `s` with one more selected expression and an `AS` name.
 //
@@ -334,7 +589,8 @@ pub fn column(s: qbast.QbSelect, name: Str) -> qbast.QbSelect []
 //     println("${list.len(qbbuild.column_as(qbbuild.select(), e, "missing").columns)}")
 // ```
 pub fn column_as(s: qbast.QbSelect, e: qbast.QbExpr, as_name: Str) -> qbast.QbSelect []
-    todo("query-builder-nv.qbbuild.column_as")
+    let cols = list.concat(s.columns, [QbColumn { expr: e, as_name: as_name }])
+    with_columns(s, cols)
 
 // `s` with several more columns, by name.
 //
@@ -346,7 +602,8 @@ pub fn column_as(s: qbast.QbSelect, e: qbast.QbExpr, as_name: Str) -> qbast.QbSe
 //     println("${list.len(qbbuild.columns(qbbuild.select(), ["id", "name"]).columns)}")
 // ```
 pub fn columns(s: qbast.QbSelect, names: [Str]) -> qbast.QbSelect []
-    todo("query-builder-nv.qbbuild.columns")
+    let cols = list.concat(s.columns, named_columns(names))
+    with_columns(s, cols)
 
 // `s` with `SELECT DISTINCT`.
 //
@@ -357,7 +614,7 @@ pub fn columns(s: qbast.QbSelect, names: [Str]) -> qbast.QbSelect []
 //     println("${qbbuild.distinct(qbbuild.select()).distinct}")
 // ```
 pub fn distinct(s: qbast.QbSelect) -> qbast.QbSelect []
-    todo("query-builder-nv.qbbuild.distinct")
+    with_distinct(s, true)
 
 // `s` with its `WHERE` REPLACED by `e`.
 //
@@ -371,7 +628,7 @@ pub fn distinct(s: qbast.QbSelect) -> qbast.QbSelect []
 //     println("${s.limit}")
 // ```
 pub fn where_(s: qbast.QbSelect, e: qbast.QbExpr) -> qbast.QbSelect []
-    todo("query-builder-nv.qbbuild.where_")
+    with_where(s, Some(e))
 
 // `s` with `e` ANDed onto whatever its `WHERE` already was.
 //
@@ -388,7 +645,7 @@ pub fn where_(s: qbast.QbSelect, e: qbast.QbExpr) -> qbast.QbSelect []
 //     println("${qbbuild.and_where(s, qbbuild.is_null("y")).limit}")
 // ```
 pub fn and_where(s: qbast.QbSelect, e: qbast.QbExpr) -> qbast.QbSelect []
-    todo("query-builder-nv.qbbuild.and_where")
+    with_where(s, Some(and_onto(s.where_, e)))
 
 // `s` with `e` ORed onto whatever its `WHERE` already was.
 //
@@ -400,7 +657,7 @@ pub fn and_where(s: qbast.QbSelect, e: qbast.QbExpr) -> qbast.QbSelect []
 //     println("${qbbuild.or_where(s, qbbuild.is_null("y")).limit}")
 // ```
 pub fn or_where(s: qbast.QbSelect, e: qbast.QbExpr) -> qbast.QbSelect []
-    todo("query-builder-nv.qbbuild.or_where")
+    with_where(s, Some(or_onto(s.where_, e)))
 
 // `s` with one more join.
 //
@@ -418,7 +675,8 @@ pub fn or_where(s: qbast.QbSelect, e: qbast.QbExpr) -> qbast.QbSelect []
 // ```
 pub fn join(s: qbast.QbSelect, kind: qbast.QbJoinKind, table: Str, as_name: Str,
             on: qbast.QbExpr) -> qbast.QbSelect []
-    todo("query-builder-nv.qbbuild.join")
+    let j = assembled_join(kind, table, as_name, on)
+    with_joins(s, list.concat(s.joins, [j]))
 
 // `s` with one more `GROUP BY` term.
 //
@@ -430,7 +688,8 @@ pub fn join(s: qbast.QbSelect, kind: qbast.QbJoinKind, table: Str, as_name: Str,
 //     println("${list.len(qbbuild.group_by(qbbuild.select(), "country").group_by)}")
 // ```
 pub fn group_by(s: qbast.QbSelect, column: Str) -> qbast.QbSelect []
-    todo("query-builder-nv.qbbuild.group_by")
+    let terms = list.concat(s.group_by, [QbCol(column)])
+    with_group_by(s, terms)
 
 // `s` with `e` ANDed onto its `HAVING`.
 //
@@ -442,7 +701,7 @@ pub fn group_by(s: qbast.QbSelect, column: Str) -> qbast.QbSelect []
 //     println("${s.limit}")
 // ```
 pub fn and_having(s: qbast.QbSelect, e: qbast.QbExpr) -> qbast.QbSelect []
-    todo("query-builder-nv.qbbuild.and_having")
+    with_having(s, Some(and_onto(s.having, e)))
 
 // `s` with one more `ORDER BY` term.
 //
@@ -455,7 +714,9 @@ pub fn and_having(s: qbast.QbSelect, e: qbast.QbExpr) -> qbast.QbSelect []
 //     println("${list.len(s.order_by)}")
 // ```
 pub fn order_by(s: qbast.QbSelect, column: Str, descending: Bool) -> qbast.QbSelect []
-    todo("query-builder-nv.qbbuild.order_by")
+    let term = QbOrder { expr: QbCol(column), descending: descending,
+                        nulls: QbNullsDefault }
+    with_order_by(s, list.concat(s.order_by, [term]))
 
 // `s` with one more `ORDER BY` term and an explicit null placement.
 //
@@ -469,7 +730,9 @@ pub fn order_by(s: qbast.QbSelect, column: Str, descending: Bool) -> qbast.QbSel
 // ```
 pub fn order_by_nulls(s: qbast.QbSelect, column: Str, descending: Bool,
                       nulls: qbast.QbNulls) -> qbast.QbSelect []
-    todo("query-builder-nv.qbbuild.order_by_nulls")
+    let term = QbOrder { expr: QbCol(column), descending: descending,
+                        nulls: nulls }
+    with_order_by(s, list.concat(s.order_by, [term]))
 
 // `s` with a row limit.
 //
@@ -480,7 +743,7 @@ pub fn order_by_nulls(s: qbast.QbSelect, column: Str, descending: Bool,
 //     println("${qbbuild.limit(qbbuild.select(), 50).limit}")
 // ```
 pub fn limit(s: qbast.QbSelect, n: Int) -> qbast.QbSelect []
-    todo("query-builder-nv.qbbuild.limit")
+    with_limit(s, n)
 
 // `s` with an offset.
 //
@@ -491,7 +754,7 @@ pub fn limit(s: qbast.QbSelect, n: Int) -> qbast.QbSelect []
 //     println("${qbbuild.offset(qbbuild.select(), 100).offset}")
 // ```
 pub fn offset(s: qbast.QbSelect, n: Int) -> qbast.QbSelect []
-    todo("query-builder-nv.qbbuild.offset")
+    with_offset(s, n)
 
 // `s` with one more CTE in front of it.
 //
@@ -505,7 +768,9 @@ pub fn offset(s: qbast.QbSelect, n: Int) -> qbast.QbSelect []
 // ```
 pub fn with_cte(s: qbast.QbSelect, name: Str, body: qbast.QbSelect,
                 recursive: Bool) -> qbast.QbSelect []
-    todo("query-builder-nv.qbbuild.with_cte")
+    let c = QbCte { name: name, columns: [], body: body,
+                    recursive: recursive }
+    with_ctes(s, list.concat(s.ctes, [c]))
 
 // `s` with another select joined to it by a set operation.
 //
@@ -521,7 +786,8 @@ pub fn with_cte(s: qbast.QbSelect, name: Str, body: qbast.QbSelect,
 //     println("${list.len(qbbuild.union(qbbuild.select(), QbUnionAll, other).set_arms)}")
 // ```
 pub fn union(s: qbast.QbSelect, op: qbast.QbSetOp, other: qbast.QbSelect) -> qbast.QbSelect []
-    todo("query-builder-nv.qbbuild.union")
+    let arm = QbSetArm { op: op, body: other }
+    with_set_arms(s, list.concat(s.set_arms, [arm]))
 
 // ── INSERT ───────────────────────────────────────────────────────────
 
@@ -538,7 +804,10 @@ pub fn union(s: qbast.QbSelect, op: qbast.QbSetOp, other: qbast.QbSelect) -> qba
 //     println("${list.len(qbbuild.insert("users", ["name", "email"]).columns)}")
 // ```
 pub fn insert(table: Str, columns: [Str]) -> qbast.QbInsert []
-    todo("query-builder-nv.qbbuild.insert")
+    QbInsert { ctes: [], table: table, columns: columns, rows: [],
+               from_select: None, conflict: QbConflictError,
+               conflict_columns: [], conflict_set: [], conflict_where: None,
+               returning: [] }
 
 // `i` with one more row of bound values.
 //
@@ -554,7 +823,8 @@ pub fn insert(table: Str, columns: [Str]) -> qbast.QbInsert []
 //     println("${list.len(qbbuild.values(i, [qbbuild.text_value("ada")]).rows)}")
 // ```
 pub fn values(i: qbast.QbInsert, row: [qbast.QbValue]) -> qbast.QbInsert []
-    todo("query-builder-nv.qbbuild.values")
+    let rows = list.concat(i.rows, [bound_all(row)])
+    with_rows(i, rows)
 
 // `i` filled from a select instead of from literal rows.
 //
@@ -567,7 +837,7 @@ pub fn values(i: qbast.QbInsert, row: [qbast.QbValue]) -> qbast.QbInsert []
 //     println("${qbbuild.insert_select(i, s).table}")
 // ```
 pub fn insert_select(i: qbast.QbInsert, s: qbast.QbSelect) -> qbast.QbInsert []
-    todo("query-builder-nv.qbbuild.insert_select")
+    with_insert_select(i, Some(s))
 
 // `i` with `ON CONFLICT DO NOTHING`.
 //
@@ -579,7 +849,7 @@ pub fn insert_select(i: qbast.QbInsert, s: qbast.QbSelect) -> qbast.QbInsert []
 //     println("${qbbuild.on_conflict_ignore(i, ["email"]).table}")
 // ```
 pub fn on_conflict_ignore(i: qbast.QbInsert, target: [Str]) -> qbast.QbInsert []
-    todo("query-builder-nv.qbbuild.on_conflict_ignore")
+    with_conflict(i, QbConflictIgnore, target, [])
 
 // `i` with `ON CONFLICT (target) DO UPDATE SET …`.
 //
@@ -596,7 +866,7 @@ pub fn on_conflict_ignore(i: qbast.QbInsert, target: [Str]) -> qbast.QbInsert []
 // ```
 pub fn on_conflict_update(i: qbast.QbInsert, target: [Str],
                           set: [qbast.QbAssign]) -> qbast.QbInsert []
-    todo("query-builder-nv.qbbuild.on_conflict_update")
+    with_conflict(i, QbConflictUpdate, target, set)
 
 // One `column = expr` assignment.
 //
@@ -607,7 +877,7 @@ pub fn on_conflict_update(i: qbast.QbInsert, target: [Str],
 //     println(qbbuild.assign("name", qbbuild.int_value(1)).column)
 // ```
 pub fn assign(column: Str, v: qbast.QbValue) -> qbast.QbAssign []
-    todo("query-builder-nv.qbbuild.assign")
+    QbAssign { column: column, value: bound(v) }
 
 // One `column = <expression>` assignment, for `count = count + 1`.
 //
@@ -618,7 +888,7 @@ pub fn assign(column: Str, v: qbast.QbValue) -> qbast.QbAssign []
 //     println(qbbuild.assign_expr("seen", qbbuild.is_null("x")).column)
 // ```
 pub fn assign_expr(column: Str, e: qbast.QbExpr) -> qbast.QbAssign []
-    todo("query-builder-nv.qbbuild.assign_expr")
+    QbAssign { column: column, value: e }
 
 // `i` with `RETURNING` items.
 //
@@ -633,7 +903,7 @@ pub fn assign_expr(column: Str, e: qbast.QbExpr) -> qbast.QbAssign []
 //     println("${list.len(qbbuild.insert_returning(i, ["id"]).returning)}")
 // ```
 pub fn insert_returning(i: qbast.QbInsert, names: [Str]) -> qbast.QbInsert []
-    todo("query-builder-nv.qbbuild.insert_returning")
+    with_insert_returning(i, named_columns(names))
 
 // ── UPDATE and DELETE ────────────────────────────────────────────────
 
@@ -650,7 +920,7 @@ pub fn insert_returning(i: qbast.QbInsert, names: [Str]) -> qbast.QbInsert []
 //     println(qbbuild.update("users").table)
 // ```
 pub fn update(table: Str) -> qbast.QbUpdate []
-    todo("query-builder-nv.qbbuild.update")
+    QbUpdate { ctes: [], table: table, set: [], from: None, where_: None, returning: [] }
 
 // `u` with one more assignment.
 //
@@ -663,7 +933,7 @@ pub fn update(table: Str) -> qbast.QbUpdate []
 //     println("${list.len(qbbuild.set(qbbuild.update("users"), a).set)}")
 // ```
 pub fn set(u: qbast.QbUpdate, a: qbast.QbAssign) -> qbast.QbUpdate []
-    todo("query-builder-nv.qbbuild.set")
+    with_updates(u, list.concat(u.set, [a]))
 
 // `u` with `e` ANDed onto its condition.
 //
@@ -675,7 +945,7 @@ pub fn set(u: qbast.QbUpdate, a: qbast.QbAssign) -> qbast.QbUpdate []
 //     println(u.table)
 // ```
 pub fn update_where(u: qbast.QbUpdate, e: qbast.QbExpr) -> qbast.QbUpdate []
-    todo("query-builder-nv.qbbuild.update_where")
+    with_update_where(u, Some(and_onto(u.where_, e)))
 
 // `u` with `RETURNING` items.
 //
@@ -688,7 +958,7 @@ pub fn update_where(u: qbast.QbUpdate, e: qbast.QbExpr) -> qbast.QbUpdate []
 //     println("${list.len(qbbuild.update_returning(u, ["id"]).returning)}")
 // ```
 pub fn update_returning(u: qbast.QbUpdate, names: [Str]) -> qbast.QbUpdate []
-    todo("query-builder-nv.qbbuild.update_returning")
+    with_update_returning(u, named_columns(names))
 
 // A `DELETE FROM table` with no condition.
 //
@@ -701,7 +971,7 @@ pub fn update_returning(u: qbast.QbUpdate, names: [Str]) -> qbast.QbUpdate []
 //     println(qbbuild.delete("sessions").table)
 // ```
 pub fn delete(table: Str) -> qbast.QbDelete []
-    todo("query-builder-nv.qbbuild.delete")
+    QbDelete { ctes: [], table: table, where_: None, returning: [] }
 
 // `d` with `e` ANDed onto its condition.
 //
@@ -713,7 +983,7 @@ pub fn delete(table: Str) -> qbast.QbDelete []
 //     println(d.table)
 // ```
 pub fn delete_where(d: qbast.QbDelete, e: qbast.QbExpr) -> qbast.QbDelete []
-    todo("query-builder-nv.qbbuild.delete_where")
+    with_delete_where(d, Some(and_onto(d.where_, e)))
 
 // `d` with `RETURNING` items.
 //
@@ -726,7 +996,7 @@ pub fn delete_where(d: qbast.QbDelete, e: qbast.QbExpr) -> qbast.QbDelete []
 //     println("${list.len(qbbuild.delete_returning(d, ["id"]).returning)}")
 // ```
 pub fn delete_returning(d: qbast.QbDelete, names: [Str]) -> qbast.QbDelete []
-    todo("query-builder-nv.qbbuild.delete_returning")
+    with_delete_returning(d, named_columns(names))
 
 // ── one page of rows ─────────────────────────────────────────────────
 
@@ -745,7 +1015,8 @@ pub fn delete_returning(d: qbast.QbDelete, names: [Str]) -> qbast.QbDelete []
 //     println("${qbbuild.page(qbbuild.select(), 2, 25).offset}")
 // ```
 pub fn page(s: qbast.QbSelect, page: Int, size: Int) -> qbast.QbSelect []
-    todo("query-builder-nv.qbbuild.page")
+    let sized = with_limit(s, size)
+    with_offset(sized, page * size)
 
 // A `SELECT COUNT(*)` over the same source, joins and conditions as
 // `s`, with its columns, ordering, limit and offset dropped.
@@ -762,4 +1033,8 @@ pub fn page(s: qbast.QbSelect, page: Int, size: Int) -> qbast.QbSelect []
 //     println("${qbbuild.count_of(qbbuild.select()).limit}")
 // ```
 pub fn count_of(s: qbast.QbSelect) -> qbast.QbSelect []
-    todo("query-builder-nv.qbbuild.count_of")
+    QbSelect { ctes: s.ctes, distinct: s.distinct, distinct_on: s.distinct_on,
+               columns: [count_column()], from: s.from, joins: s.joins,
+               where_: s.where_, group_by: s.group_by, having: s.having,
+               order_by: [], limit: -1, offset: -1, set_arms: s.set_arms,
+               for_update: s.for_update }

@@ -1,8 +1,6 @@
 // qbast.nv — a SQL statement as a value: the whole vocabulary, in one
 // module.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THE VALUE IS IN THE TREE, NOT IN A LIST BESIDE IT.  That is the
 // load-bearing decision, and it is what makes this a query builder
 // rather than a string joiner with extra steps.  `QbBind(v)` puts the
@@ -384,6 +382,226 @@ pub enum QbStmt
     QbStmtUpdate(body: QbUpdate)
     QbStmtDelete(body: QbDelete)
 
+// ── The walk, and the events it reports ──────────────────────────────
+//
+// ONE WALK, FOUR ANSWERS.  `tables_of`, `binds_of`, `raw_count` and
+// `depth` are four questions about one traversal, and the traversal is
+// the render's own order: clause by clause and left to right, which is
+// the order the placeholders come out in.  It is written once, here, so
+// the four cannot drift from one another — and `qbrender` numbers its
+// placeholders in this same order, which the suite pins against
+// `binds_of` on a statement that uses every clause.
+
+// One thing the walk saw.  A bind carries its value, so this walk is
+// what answers `binds_of` too; `QbEvEnter` and `QbEvLeave` bracket a
+// subquery, so how deep a statement nests is a running count rather
+// than a second traversal.
+enum QbEvent
+    QbEvBind(v: QbValue)
+    QbEvTable(name: Str)
+    QbEvRaw
+    QbEvEnter
+    QbEvLeave
+
+// Everything the statement holds, in the order a render meets it.
+fn events_of(s: QbStmt) -> [QbEvent]
+    var out: [QbEvent] = []
+    walk_stmt(var out, s)
+    out
+
+fn walk_stmt(var out: [QbEvent], s: QbStmt)
+    match s
+        QbStmtSelect(body) => walk_select(var out, body)
+        QbStmtInsert(body) => walk_insert(var out, body)
+        QbStmtUpdate(body) => walk_update(var out, body)
+        QbStmtDelete(body) => walk_delete(var out, body)
+
+// A `SELECT`, in the order its clauses are written: the `WITH` list,
+// the items, the source, the joins, then `WHERE`, `GROUP BY`,
+// `HAVING`, the arms of any set operation, and `ORDER BY` last —
+// because a `UNION` that carries an `ORDER BY` applies it to the whole
+// of itself, which is what SQL means by the clause being after the
+// arms.
+fn walk_select(var out: [QbEvent], sel: QbSelect)
+    for c in sel.ctes
+        walk_cte(var out, c)
+    for d in sel.distinct_on
+        walk_expr(var out, d)
+    for c in sel.columns
+        walk_expr(var out, c.expr)
+    match sel.from
+        Some(src) => walk_source(var out, src)
+        None      => ()
+    for j in sel.joins
+        walk_join(var out, j)
+    match sel.where_
+        Some(cond) => walk_expr(var out, cond)
+        None       => ()
+    for g in sel.group_by
+        walk_expr(var out, g)
+    match sel.having
+        Some(cond) => walk_expr(var out, cond)
+        None       => ()
+    for arm in sel.set_arms
+        walk_select(var out, arm.body)
+    for o in sel.order_by
+        walk_expr(var out, o.expr)
+
+fn walk_cte(var out: [QbEvent], c: QbCte)
+    walk_select(var out, c.body)
+
+// A source: a table is a name, a CTE reference is a name that is not a
+// table, and a subquery is one level deeper.
+fn walk_source(var out: [QbEvent], src: QbSource)
+    match src
+        QbTable(name, as_name)     => list.push(out, QbEvTable(name))
+        QbSubquery(inner, as_name) =>
+            list.push(out, QbEvEnter)
+            walk_select(var out, inner)
+            list.push(out, QbEvLeave)
+        QbCteRef(name, as_name)    => ()
+
+// `JOIN <source> ON <condition>`: the source first, which is the order
+// the condition's placeholders follow.
+fn walk_join(var out: [QbEvent], j: QbJoin)
+    walk_source(var out, j.source)
+    match j.on
+        Some(cond) => walk_expr(var out, cond)
+        None       => ()
+
+// `WITH …, INSERT INTO t (…), VALUES …|SELECT …, ON CONFLICT …,
+// RETURNING …`.
+fn walk_insert(var out: [QbEvent], ins: QbInsert)
+    for c in ins.ctes
+        walk_cte(var out, c)
+    list.push(out, QbEvTable(ins.table))
+    for row in ins.rows
+        for cell in row
+            walk_expr(var out, cell)
+    match ins.from_select
+        Some(sel) =>
+            list.push(out, QbEvEnter)
+            walk_select(var out, sel)
+            list.push(out, QbEvLeave)
+        None      => ()
+    for a in ins.conflict_set
+        walk_expr(var out, a.value)
+    match ins.conflict_where
+        Some(cond) => walk_expr(var out, cond)
+        None       => ()
+    for r in ins.returning
+        walk_expr(var out, r.expr)
+
+// `WITH …, UPDATE t SET …, FROM …, WHERE …, RETURNING …`.
+fn walk_update(var out: [QbEvent], upd: QbUpdate)
+    for c in upd.ctes
+        walk_cte(var out, c)
+    list.push(out, QbEvTable(upd.table))
+    for a in upd.set
+        walk_expr(var out, a.value)
+    match upd.from
+        Some(src) => walk_source(var out, src)
+        None      => ()
+    match upd.where_
+        Some(cond) => walk_expr(var out, cond)
+        None       => ()
+    for r in upd.returning
+        walk_expr(var out, r.expr)
+
+// `WITH …, DELETE FROM t WHERE …, RETURNING …`.
+fn walk_delete(var out: [QbEvent], del: QbDelete)
+    for c in del.ctes
+        walk_cte(var out, c)
+    list.push(out, QbEvTable(del.table))
+    match del.where_
+        Some(cond) => walk_expr(var out, cond)
+        None       => ()
+    for r in del.returning
+        walk_expr(var out, r.expr)
+
+// One expression, in the order its bytes go out.  A `CASE` interleaves
+// its branches — `WHEN a THEN b WHEN c THEN d` — and an aggregate's
+// `FILTER` clause comes after its arguments, which is the order the
+// placeholders are numbered in.
+fn walk_expr(var out: [QbEvent], e: QbExpr)
+    match e
+        QbCol(name)                               => ()
+        QbQual(table, column)                     => ()
+        QbStar                                    => ()
+        QbQualStar(table)                         => ()
+        QbBind(value)                             => list.push(out, QbEvBind(value))
+        QbLit(value)                              => ()
+        QbRaw(sql)                                => list.push(out, QbEvRaw)
+        QbCmp(op, lhs, rhs)                       =>
+            walk_expr(var out, lhs)
+            walk_expr(var out, rhs)
+        QbBinop(op, lhs, rhs)                     =>
+            walk_expr(var out, lhs)
+            walk_expr(var out, rhs)
+        QbAnd(lhs, rhs)                           =>
+            walk_expr(var out, lhs)
+            walk_expr(var out, rhs)
+        QbOr(lhs, rhs)                            =>
+            walk_expr(var out, lhs)
+            walk_expr(var out, rhs)
+        QbNot(operand)                            => walk_expr(var out, operand)
+        QbIsNull(operand, negated)                => walk_expr(var out, operand)
+        QbIn(operand, values, negated)            =>
+            walk_expr(var out, operand)
+            for v in values
+                walk_expr(var out, v)
+        QbInSelect(operand, inner, negated)       =>
+            walk_expr(var out, operand)
+            list.push(out, QbEvEnter)
+            walk_select(var out, inner)
+            list.push(out, QbEvLeave)
+        QbBetween(operand, low, high, negated)    =>
+            walk_expr(var out, operand)
+            walk_expr(var out, low)
+            walk_expr(var out, high)
+        QbLike(operand, pattern, escape, negated) =>
+            walk_expr(var out, operand)
+            walk_expr(var out, pattern)
+        QbILike(operand, pattern, negated)        =>
+            walk_expr(var out, operand)
+            walk_expr(var out, pattern)
+        QbFn(name, args)                          =>
+            for a in args
+                walk_expr(var out, a)
+        QbAgg(name, args, distinct, filter)       =>
+            for a in args
+                walk_expr(var out, a)
+            match filter
+                Some(cond) => walk_expr(var out, cond)
+                None       => ()
+        QbCast(operand, ty)                       => walk_expr(var out, operand)
+        QbCase(whens, thens, otherwise)           =>
+            walk_case_branches(var out, whens, thens)
+            match otherwise
+                Some(alt) => walk_expr(var out, alt)
+                None      => ()
+        QbCoalesce(args)                          =>
+            for a in args
+                walk_expr(var out, a)
+        QbExists(inner, negated)                  =>
+            list.push(out, QbEvEnter)
+            walk_select(var out, inner)
+            list.push(out, QbEvLeave)
+        QbScalar(inner)                           =>
+            list.push(out, QbEvEnter)
+            walk_select(var out, inner)
+            list.push(out, QbEvLeave)
+
+// The `WHEN … THEN …` pairs, a pair at a time.  A `CASE` whose two
+// lists differ in length is a fault the render refuses; the walk stops
+// at the shorter of the two rather than reading past its end.
+fn walk_case_branches(var out: [QbEvent], whens: [QbExpr], thens: [QbExpr])
+    var i = 0
+    while i < list.len(whens) and i < list.len(thens)
+        walk_expr(var out, list.get(whens, i))
+        walk_expr(var out, list.get(thens, i))
+        i = i + 1
+
 // The table a statement writes to, or the empty string for a `SELECT`.
 //
 // What an audit log, a permission check and a cache invalidation all
@@ -398,7 +616,11 @@ pub enum QbStmt
 //     println("[${qbast.target_table(QbStmtSelect(qbbuild.select()))}]")
 // ```
 pub fn target_table(s: QbStmt) -> Str []
-    todo("query-builder-nv.qbast.target_table")
+    match s
+        QbStmtSelect(body) => ""
+        QbStmtInsert(body) => body.table
+        QbStmtUpdate(body) => body.table
+        QbStmtDelete(body) => body.table
 
 // True when the statement changes rows.
 //
@@ -410,7 +632,11 @@ pub fn target_table(s: QbStmt) -> Str []
 //     println("${qbast.is_write(QbStmtSelect(qbbuild.select()))}")
 // ```
 pub fn is_write(s: QbStmt) -> Bool []
-    todo("query-builder-nv.qbast.is_write")
+    match s
+        QbStmtSelect(body) => false
+        QbStmtInsert(body) => true
+        QbStmtUpdate(body) => true
+        QbStmtDelete(body) => true
 
 // Every table a statement reads or writes, including through its
 // joins, its subqueries and its CTEs, in the order they appear and
@@ -428,7 +654,17 @@ pub fn is_write(s: QbStmt) -> Bool []
 //     println("${list.len(qbast.tables_of(QbStmtSelect(qbbuild.select())))}")
 // ```
 pub fn tables_of(s: QbStmt) -> [Str] []
-    todo("query-builder-nv.qbast.tables_of")
+    var out: [Str] = []
+    for ev in events_of(s)
+        match ev
+            QbEvTable(name) =>
+                if not list.contains(out, name)
+                    list.push(out, name)
+            QbEvBind(v)     => ()
+            QbEvRaw         => ()
+            QbEvEnter       => ()
+            QbEvLeave       => ()
+    out
 
 // Every value the statement would bind, in the order `qbrender` would
 // assign them positions.
@@ -445,7 +681,15 @@ pub fn tables_of(s: QbStmt) -> [Str] []
 //     println("${list.len(qbast.binds_of(QbStmtSelect(qbbuild.select())))}")
 // ```
 pub fn binds_of(s: QbStmt) -> [QbValue] []
-    todo("query-builder-nv.qbast.binds_of")
+    var out: [QbValue] = []
+    for ev in events_of(s)
+        match ev
+            QbEvBind(v)     => list.push(out, v)
+            QbEvTable(name) => ()
+            QbEvRaw         => ()
+            QbEvEnter       => ()
+            QbEvLeave       => ()
+    out
 
 // How many `QbRaw` expressions the statement contains.
 //
@@ -462,7 +706,16 @@ pub fn binds_of(s: QbStmt) -> [QbValue] []
 //     println("${qbast.raw_count(QbStmtSelect(qbbuild.select()))}")
 // ```
 pub fn raw_count(s: QbStmt) -> Int []
-    todo("query-builder-nv.qbast.raw_count")
+    var n = 0
+    for ev in events_of(s)
+        match ev
+            QbEvRaw         =>
+                n = n + 1
+            QbEvBind(v)     => ()
+            QbEvTable(name) => ()
+            QbEvEnter       => ()
+            QbEvLeave       => ()
+    n
 
 // How deep the statement nests subqueries.
 //
@@ -479,4 +732,17 @@ pub fn raw_count(s: QbStmt) -> Int []
 //     println("${qbast.depth(QbStmtSelect(qbbuild.select()))}")
 // ```
 pub fn depth(s: QbStmt) -> Int []
-    todo("query-builder-nv.qbast.depth")
+    var level = 0
+    var best = 0
+    for ev in events_of(s)
+        match ev
+            QbEvEnter       =>
+                level = level + 1
+                if level > best
+                    best = level
+            QbEvLeave       =>
+                level = level - 1
+            QbEvBind(v)     => ()
+            QbEvTable(name) => ()
+            QbEvRaw         => ()
+    best
