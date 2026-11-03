@@ -117,6 +117,8 @@ that a caller should know before depending on it.
   (`memory-perceus/a-str-field-read-off-a-temporary-lists-element-answers-a-freed-borrow`,
   filed from this package).
 
+This release requires novo 0.23.0 or later.
+
 ## 0.0.2 — 2026-09-15
 
 README rewritten to the package README style guide (docs/writing-a-readme.md).
